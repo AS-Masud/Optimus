@@ -1,12 +1,12 @@
-import ccxt
 import pandas as pd
 import pusher
 import time
 import os
 import threading
 from flask import Flask
+import yfinance as yf
 
-# Flask Web Server Setup (Required for Render)
+# Flask Web Server Setup (Required for Render uptime)
 app = Flask(__name__)
 
 # --- 1. Pusher Setup ---
@@ -18,19 +18,30 @@ pusher_client = pusher.Pusher(
   ssl=True
 )
 
-# --- 2. Binance Setup ---
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {
-        'defaultType': 'spot'
-    }
-})
-symbol = 'BTC/USDT'
+# --- 2. Multi-Currency Quotex Forex List (15 Pairs) ---
+forex_pairs = {
+    'EURUSD=X': 'EUR/USD',
+    'GBPUSD=X': 'GBP/USD',
+    'USDJPY=X': 'USD/JPY',
+    'AUDUSD=X': 'AUD/USD',
+    'USDCAD=X': 'USD/CAD',
+    'NZDUSD=X': 'NZD/USD',
+    'USDCHF=X': 'USD/CHF',
+    'EURJPY=X': 'EUR/JPY',
+    'GBPJPY=X': 'GBP/JPY',
+    'EURGBP=X': 'EUR/GBP',
+    'AUDJPY=X': 'AUD/JPY',
+    'CADJPY=X': 'CAD/JPY',
+    'CHFJPY=X': 'CHF/JPY',
+    'EURAUD=X': 'EUR/AUD',
+    'GBPAUD=X': 'GBP/AUD'
+}
+
 timeframe = '1m'     
-last_signal = None   
+last_signals = {}   # Track last signal per currency pair to avoid spamming
 
 def send_signal(pair, direction, tf):
-    print(f"✅ Advanced Signal Sent: {pair} -> {direction} ({tf})")
+    print(f"✅ Quotex Signal Sent: {pair} -> {direction} ({tf})")
     pusher_client.trigger('trading-signals', 'new-signal', {
         'pair': pair,
         'direction': direction,
@@ -38,57 +49,69 @@ def send_signal(pair, direction, tf):
     })
 
 def analyze_market():
-    global last_signal
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # --- Pure Pandas Technical Calculations (No external pandas-ta needed) ---
-        # 1. Calculate RSI (14)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI_14'] = 100 - (100 / (1 + rs))
-
-        # 2. Calculate Bollinger Bands (20, 2)
-        df['MA20'] = df['close'].rolling(window=20).mean()
-        df['STD20'] = df['close'].rolling(window=20).std()
-        df['Lower_BB'] = df['MA20'] - (df['STD20'] * 2)
-        df['Upper_BB'] = df['MA20'] + (df['STD20'] * 2)
-        
-        current_price = df['close'].iloc[-1]
-        current_rsi = df['RSI_14'].iloc[-1]
-        lower_band = df['Lower_BB'].iloc[-1]
-        upper_band = df['Upper_BB'].iloc[-1]
-        
-        print(f"Live... Price: {current_price} | RSI: {current_rsi:.2f} | Lower BB: {lower_band:.2f} | Upper BB: {upper_band:.2f}")
-
-        if current_rsi < 30 and current_price <= lower_band and last_signal != "CALL":
-            send_signal(symbol, "CALL", "1 Minute")
-            last_signal = "CALL"
-            time.sleep(60) 
+    global last_signals
+    
+    # Loop through each currency pair dynamically
+    for yahoo_symbol, display_name in forex_pairs.items():
+        try:
+            df = yf.download(yahoo_symbol, period='1d', interval='1m', progress=False)
             
-        elif current_rsi > 70 and current_price >= upper_band and last_signal != "PUT":
-            send_signal(symbol, "PUT", "1 Minute")
-            last_signal = "PUT"
-            time.sleep(60)
-            
-        elif 40 < current_rsi < 60:
-            last_signal = None 
+            if df.empty:
+                continue
 
-    except Exception as e:
-        print(f"Error fetching data: {e}")
+            # Handle multi-index columns if returned by yfinance
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            # --- Technical Calculations (RSI 14 & Bollinger Bands 20, 2) ---
+            delta = df['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['RSI_14'] = 100 - (100 / (1 + rs))
+
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            df['STD20'] = df['Close'].rolling(window=20).std()
+            df['Lower_BB'] = df['MA20'] - (df['STD20'] * 2)
+            df['Upper_BB'] = df['MA20'] + (df['STD20'] * 2)
+            
+            current_price = float(df['Close'].iloc[-1])
+            current_rsi = float(df['RSI_14'].iloc[-1])
+            lower_band = float(df['Lower_BB'].iloc[-1])
+            upper_band = float(df['Upper_BB'].iloc[-1])
+            
+            print(f"Scanning {display_name} | Price: {current_price:.5f} | RSI: {current_rsi:.2f}")
+
+            current_last_signal = last_signals.get(display_name, None)
+
+            # Strategy conditions for 1-minute binary options
+            if current_rsi < 30 and current_price <= lower_band and current_last_signal != "CALL":
+                send_signal(display_name, "CALL", "1 Min")
+                last_signals[display_name] = "CALL"
+                
+            elif current_rsi > 70 and current_price >= upper_band and current_last_signal != "PUT":
+                send_signal(display_name, "PUT", "1 Min")
+                last_signals[display_name] = "PUT"
+                
+            elif 40 < current_rsi < 60:
+                last_signals[display_name] = None 
+
+            # Small pause between fetching pairs to respect rate limits
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"Error on {display_name}: {e}")
 
 def run_bot():
-    print(f"🤖 Background Bot Started! Monitoring {symbol}...")
+    print("🤖 Multi-Currency Quotex Bot Started!")
     while True:
         analyze_market()
-        time.sleep(10)
+        # Pause before starting the next full loop scan of all currency pairs
+        time.sleep(20)
 
 @app.route('/')
 def alive():
-    return "Bot is alive and running 24/7!"
+    return "Quotex Multi-Currency Bot is alive and running 24/7!"
 
 if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot)
