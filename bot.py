@@ -19,9 +19,9 @@ pusher_client = pusher.Pusher(
     ssl=True
 )
 
-# --- 2. Telegram Setup (For Mobile Notifications) ---
-TELEGRAM_BOT_TOKEN = '8893372314:AAEVyqxOmFmx-P0-tQlWq_nDNhsDWs9KK54'  # Enter your BotFather token here
-TELEGRAM_CHAT_ID = '-1004489990906'      # Enter your Telegram chat ID here
+# --- 2. Telegram Setup (For Optimus Trade Channel) ---
+TELEGRAM_BOT_TOKEN = '8893372314:AAEVyqxOmFmx-P0-tQlWq_nDNhsDWs9KK54'
+TELEGRAM_CHAT_ID = '-1004489990906'
 
 # --- 3. Multi-Currency Quotex Forex List (15 Pairs) ---
 forex_pairs = {
@@ -58,12 +58,12 @@ def send_signal(pair, direction, tf):
     except Exception as e:
         print(f"Pusher error: {e}")
     
-    # 2. Send direct Telegram notification to mobile
+    # 2. Send direct Telegram notification to Optimus Trade Channel
     try:
         message = f"🚨 Quotex Trading Signal!\n\nCurrency: {pair}\nDirection: {direction} (CALL/PUT)\nTimeframe: {tf}"
-        url = f"https://api.telegram.org/bot{8893372314:AAEVyqxOmFmx-P0-tQlWq_nDNhsDWs9KK54}/sendMessage"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
-            'chat_id': -1004489990906,
+            'chat_id': TELEGRAM_CHAT_ID,
             'text': message
         }
         requests.post(url, json=payload)
@@ -134,9 +134,6 @@ if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
-    
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
