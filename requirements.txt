@@ -3,3 +3,4 @@ pusher
 Flask
 gunicorn
 yfinance
+requests
