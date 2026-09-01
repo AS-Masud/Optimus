@@ -1,5 +1,5 @@
-ccxt
 pandas
 pusher
 Flask
 gunicorn
+yfinance
