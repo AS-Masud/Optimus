@@ -20,8 +20,8 @@ pusher_client = pusher.Pusher(
 )
 
 # --- 2. Telegram Setup (For Mobile Notifications) ---
-TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE'  # Enter your BotFather token here
-TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID_HERE'      # Enter your Telegram chat ID here
+TELEGRAM_BOT_TOKEN = '8893372314:AAEVyqxOmFmx-P0-tQlWq_nDNhsDWs9KK54'  # Enter your BotFather token here
+TELEGRAM_CHAT_ID = '-1004489990906'      # Enter your Telegram chat ID here
 
 # --- 3. Multi-Currency Quotex Forex List (15 Pairs) ---
 forex_pairs = {
@@ -134,6 +134,9 @@ if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
+    
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
