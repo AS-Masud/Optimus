@@ -47,114 +47,131 @@ forex_pairs = {
     'GBPAUD=X': 'GBP/AUD'
 }
 
-last_signals = {}   # Track last signal per currency pair to avoid spamming
-
 def send_signal(pair, direction, tf):
-    print(f"\n✅ SIGNAL DETECTED: {pair} -> {direction} ({tf})")
-    
-    # 1. Trigger Pusher for Netlify Dashboard
-    try:
-        pusher_client.trigger('trading-signals', 'new-signal', {
-            'pair': pair,
-            'direction': direction,
-            'timeframe': tf
-        })
-        print("   -> Pusher notification sent.")
-    except Exception as e:
-        print(f"   -> ❌ Pusher error: {e}")
-    
-    # 2. Send direct Telegram notification
-    try:
-        message = f"🚨 *Quotex Trading Signal!*\n\n💱 Currency: {pair}\n📈 Direction: {direction} (CALL/PUT)\n⏱ Timeframe: {tf}"
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'Markdown'
-        }
-        
-        response = requests.post(url, json=payload, timeout=10)
-        
-        if response.status_code != 200:
-            print(f"   -> ❌ Telegram Failed! Code: {response.status_code}, Reason: {response.text}")
-        else:
-            print("   -> ✅ Telegram message sent successfully!")
-            
-    except Exception as e:
-        print(f"   -> ❌ Telegram Network Error: {e}")
+  print(f'✅ Quotex Signal Sent: {pair} -> {direction} ({tf})')
+
+  # 1. Trigger Pusher for Netlify Dashboard
+  try:
+    pusher_client.trigger(
+        'trading-signals',
+        'new-signal',
+        {'pair': pair, 'direction': direction, 'timeframe': tf},
+    )
+  except Exception as e:
+    print(f'⚠️ Pusher error: {e}')
+
+  # 2. Send Telegram notification (Timeout enforced to prevent stalls)
+  try:
+    message = (
+        f'🚨 Quotex Trading Signal!\n\nCurrency: {pair}\nDirection:'
+        f' {direction} (CALL/PUT)\nTimeframe: {tf}'
+    )
+    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
+    requests.post(url, json=payload, timeout=8)
+  except Exception as e:
+    print(f'⚠️ Telegram error: {e}')
+
 
 def analyze_market():
-    global last_signals
-    
-    for yahoo_symbol, display_name in forex_pairs.items():
-        try:
-            df = yf.download(yahoo_symbol, period='1d', interval='1m', progress=False)
-            
-            if df.empty or len(df) < 20:
-                continue
+  global last_signals
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+  for yahoo_symbol, display_name in forex_pairs.items():
+    try:
+      # Explicit timeout prevents the request from hanging indefinitely on cloud hosts
+      df = yf.download(
+          yahoo_symbol, period='1d', interval='1m', progress=False, timeout=10
+      )
 
-            # --- Technical Calculations ---
-            delta = df['Close'].diff()
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-            avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-            avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-            rs = avg_gain / avg_loss.replace(0, 0.0001)
-            df['RSI_14'] = 100 - (100 / (1 + rs))
+      if df is None or df.empty or len(df) < 25:
+        continue
 
-            df['MA20'] = df['Close'].rolling(window=20).mean()
-            df['STD20'] = df['Close'].rolling(window=20).std()
-            df['Lower_BB'] = df['MA20'] - (df['STD20'] * 2)
-            df['Upper_BB'] = df['MA20'] + (df['STD20'] * 2)
-            
-            current_price = float(df['Close'].iloc[-1])
-            current_rsi = float(df['RSI_14'].iloc[-1])
-            lower_band = float(df['Lower_BB'].iloc[-1])
-            upper_band = float(df['Upper_BB'].iloc[-1])
-            
-            print(f"Scanning {display_name} | Price: {current_price:.5f} | RSI: {current_rsi:.2f}")
+      # Flatten MultiIndex columns if returned by newer yfinance versions
+      if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-            current_last_signal = last_signals.get(display_name, None)
+      # Ensure Close series is 1-dimensional
+      close_series = df['Close']
+      if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
 
-            # --- Signal Logic ---
-            if current_rsi < 30 and current_price <= lower_band and current_last_signal != "CALL":
-                send_signal(display_name, "CALL", "1 Min")
-                last_signals[display_name] = "CALL"
-                
-            elif current_rsi > 70 and current_price >= upper_band and current_last_signal != "PUT":
-                send_signal(display_name, "PUT", "1 Min")
-                last_signals[display_name] = "PUT"
-                
-            elif 40 < current_rsi < 60:
-                last_signals[display_name] = None 
+      # Technical Calculations (RSI 14 & Bollinger Bands 20, 2)
+      delta = close_series.diff()
+      gain = (delta.where(delta > 0, 0.0)).rolling(window=14).mean()
+      loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
 
-            time.sleep(2) # Avoid Yahoo Finance IP ban
+      # Prevent division by zero errors
+      rs = gain / loss.replace(0, np.nan)
+      rsi_series = 100 - (100 / (1 + rs))
+      rsi_series = rsi_series.fillna(50.0)
 
-        except Exception as e:
-            print(f"Error on {display_name}: {e}")
+      ma20 = close_series.rolling(window=20).mean()
+      std20 = close_series.rolling(window=20).std()
+      lower_bb = ma20 - (std20 * 2)
+      upper_bb = ma20 + (std20 * 2)
+
+      current_price = float(close_series.iloc[-1])
+      current_rsi = float(rsi_series.iloc[-1])
+      lower_band = float(lower_bb.iloc[-1])
+      upper_band = float(upper_bb.iloc[-1])
+
+      print(
+          f'Scanning {display_name} | Price: {current_price:.5f} | RSI:'
+          f' {current_rsi:.2f}'
+      )
+
+      current_last_signal = last_signals.get(display_name, None)
+
+      if (
+          current_rsi < 30
+          and current_price <= lower_band
+          and current_last_signal != 'CALL'
+      ):
+        send_signal(display_name, 'CALL', '1 Min')
+        last_signals[display_name] = 'CALL'
+
+      elif (
+          current_rsi > 70
+          and current_price >= upper_band
+          and current_last_signal != 'PUT'
+      ):
+        send_signal(display_name, 'PUT', '1 Min')
+        last_signals[display_name] = 'PUT'
+
+      elif 40 < current_rsi < 60:
+        last_signals[display_name] = None
+
+    except Exception as e:
+      print(f'⚠️ Error on {display_name}: {e}')
+
+    # Short pause to prevent Yahoo Finance HTTP 429 rate-limiting
+    time.sleep(1.5)
+
 
 def run_bot():
-    print("🤖 Multi-Currency Quotex Bot Started with Telegram & Pusher!")
-    while True:
-        analyze_market()
-        print("--- Waiting 60 seconds for next 1-minute candle ---")
-        time.sleep(60)
+  print('🤖 Multi-Currency Quotex Bot Started with Telegram & Pusher!')
+  time.sleep(3)
 
-# =====================================================================
-# 🚨 GUNICORN FIX: Start the background thread OUTSIDE if __name__ == "__main__"
-# =====================================================================
-bot_thread = threading.Thread(target=run_bot)
-bot_thread.daemon = True
-bot_thread.start()
+  # Master loop: prevents unexpected errors from permanently killing the scanner thread
+  while True:
+    try:
+      analyze_market()
+    except Exception as fatal_err:
+      print(f'🚨 Critical error caught in scanner loop: {fatal_err}')
+      traceback.print_exc()
+      time.sleep(10)
+
+    time.sleep(20)
+
 
 @app.route('/')
 def alive():
-    return "Quotex Multi-Currency Bot with Telegram is alive and running 24/7!"
+  return 'Quotex Multi-Currency Bot with Telegram is alive and running 24/7!'
 
-if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+
+if __name__ == '__main__':
+  bot_thread = threading.Thread(target=run_bot, daemon=True)
+  bot_thread.start()
+
+  port = int(os.environ.get('PORT', 5000))
+  app.run(host='0.0.0.0', port=port)
