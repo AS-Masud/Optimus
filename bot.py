@@ -28,11 +28,16 @@ pusher_client = pusher.Pusher(
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- Quotex Account Credentials ---
+# --- Quotex Account Credentials & Session ---
 QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'your_email@example.com')
 QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'your_password')
+QUOTEX_COOKIE = os.environ.get('QUOTEX_COOKIE', '')
+USER_AGENT = os.environ.get(
+    'USER_AGENT', 
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+)
 
-# --- Assets List ---
+# --- Currency Pairs to Scan ---
 forex_pairs = [
     "EURUSD", "GBPJPY", "USDJPY", "AUDJPY", "EURJPY",
     "AUDCAD", "CADJPY", "CHFJPY", "EURAUD", "GBPCAD",
@@ -42,11 +47,23 @@ forex_pairs = [
 last_signals = {}
 
 
+def parse_cookies(cookie_str):
+    """Converts a raw cookie string into a clean dictionary for pyquotex."""
+    cookie_dict = {}
+    if cookie_str:
+        for item in cookie_str.split(';'):
+            item = item.strip()
+            if '=' in item:
+                key, val = item.split('=', 1)
+                cookie_dict[key] = val
+    return cookie_dict
+
+
 def send_signal(pair, direction, tf, strategy_name):
     """Dispatches trading signals to Pusher Dashboard and Telegram Channel."""
     print(f"\n[SIGNAL] {pair} -> {direction} ({strategy_name})")
 
-    # 1. Pusher Dashboard Event
+    # 1. Pusher Dashboard Trigger
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
             'pair': pair,
@@ -57,7 +74,7 @@ def send_signal(pair, direction, tf, strategy_name):
     except Exception as e:
         print(f"   -> Pusher Error: {e}")
 
-    # 2. Telegram Alert
+    # 2. Telegram Message Alert
     try:
         message = (
             f"🚨 *Quotex Pure Price Action Signal!*\n\n"
@@ -76,22 +93,22 @@ def send_signal(pair, direction, tf, strategy_name):
         if response.status_code != 200:
             print(f"   -> Telegram API Failed: {response.status_code} - {response.text}")
         else:
-            print("   -> Telegram alert delivered successfully.")
+            print("   -> Telegram alert sent successfully.")
     except Exception as e:
         print(f"   -> Telegram Network Exception: {e}")
 
 
 async def run_price_action(client):
-    """Fetches real-time candles asynchronously and executes Price Action scans."""
+    """Asynchronously fetches Quotex candles and executes the Price Action rules."""
     global last_signals
 
     for base_pair in forex_pairs:
         try:
             pair_name = base_pair
-            # Await candle data asynchronously (1-minute candles, 30 periods)
+            # 60s (1 min) timeframe, 30 candles
             candles = await client.get_candles(pair_name, 60, 30)
 
-            # Fallback to OTC if regular pair market is closed
+            # If standard asset returns no data (market closed), fall back to OTC
             if not candles:
                 pair_name = f"{base_pair}_otc"
                 candles = await client.get_candles(pair_name, 60, 30)
@@ -99,7 +116,7 @@ async def run_price_action(client):
             if not candles or len(candles) < 25:
                 continue
 
-            # Convert to DataFrame and standardize column names
+            # Convert to Pandas DataFrame
             df = pd.DataFrame(candles)
             df.rename(
                 columns={'max': 'High', 'min': 'Low', 'open': 'Open', 'close': 'Close'},
@@ -110,7 +127,7 @@ async def run_price_action(client):
             df['Support'] = df['Low'].shift(1).rolling(window=20).min()
             df['Resistance'] = df['High'].shift(1).rolling(window=20).max()
 
-            # --- 2. Candlestick Properties ---
+            # --- 2. Candlestick Dimensional Properties ---
             df['Prev_Open'] = df['Open'].shift(1)
             df['Prev_Close'] = df['Close'].shift(1)
 
@@ -141,13 +158,14 @@ async def run_price_action(client):
             bullish_pressure = (df['Close'] > df['Open']) & (body > (total_range * 0.5)) & (upper_wick < (body * 0.2))
             bearish_pressure = (df['Open'] > df['Close']) & (body > (total_range * 0.5)) & (lower_wick < (body * 0.2))
 
+            # Current price metrics
             curr_low = float(df['Low'].iloc[-1])
             curr_high = float(df['High'].iloc[-1])
             curr_close = float(df['Close'].iloc[-1])
             support = float(df['Support'].iloc[-1])
             resistance = float(df['Resistance'].iloc[-1])
 
-            # Buffer zone (0.02%)
+            # Buffer threshold (0.02%)
             buffer = curr_close * 0.0002
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
@@ -156,7 +174,7 @@ async def run_price_action(client):
 
             curr_last = last_signals.get(pair_name, None)
 
-            # --- 4. Signal Trigger Logic ---
+            # --- 4. Signal Trigger Evaluation ---
             # CALL Signals (Support Zone)
             if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
@@ -181,7 +199,7 @@ async def run_price_action(client):
                     send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
                     last_signals[pair_name] = "PUT"
 
-            # Reset signal trigger once price moves away from S/R zone
+            # Reset signal status when price leaves the zone
             elif not at_support and not at_resistance:
                 last_signals[pair_name] = None
 
@@ -192,9 +210,17 @@ async def run_price_action(client):
 
 
 async def async_run_bot():
-    """Asynchronous entry point that maintains the persistent Quotex connection."""
-    print("[INIT] Connecting to Quotex WebSocket Gateway...")
-    client = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD)
+    """Main asynchronous loop for Quotex WebSocket gateway."""
+    print("[INIT] Connecting to Quotex WebSocket Gateway via Session Cookie...")
+    
+    parsed_cookies = parse_cookies(QUOTEX_COOKIE)
+
+    client = Quotex(
+        email=QUOTEX_EMAIL,
+        password=QUOTEX_PASSWORD,
+        cookies=parsed_cookies,
+        user_agent=USER_AGENT
+    )
 
     connected, reason = await client.connect()
 
@@ -213,11 +239,11 @@ async def async_run_bot():
 
 
 def start_bot_thread():
-    """Launches the asyncio event loop inside a daemonized background thread."""
+    """Runs the asyncio loop in a separate background daemon thread."""
     asyncio.run(async_run_bot())
 
 
-# Launch background worker
+# Launch background worker thread
 bot_thread = threading.Thread(target=start_bot_thread)
 bot_thread.daemon = True
 bot_thread.start()
