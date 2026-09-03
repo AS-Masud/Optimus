@@ -38,7 +38,7 @@ USER_AGENT = os.environ.get(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
 )
 
-# --- Currency Pairs to Scan ---
+# --- Base Currency Pairs ---
 forex_pairs = [
     "EURUSD", "GBPJPY", "USDJPY", "AUDJPY", "EURJPY",
     "AUDCAD", "CADJPY", "CHFJPY", "EURAUD", "GBPCAD",
@@ -99,6 +99,32 @@ def send_signal(pair, direction, tf, strategy_name):
         print(f"   -> Telegram Network Exception: {e}", flush=True)
 
 
+async def fetch_pair_candles(client, base_pair, current_time, offset, period):
+    """Tries multiple naming formats for live and OTC assets."""
+    formatted_slash = f"{base_pair[:3]}/{base_pair[3:]}"
+    candidate_names = [
+        base_pair,                     # EURUSD
+        formatted_slash,               # EUR/USD
+        f"{base_pair} (OTC)",          # EURUSD (OTC)
+        f"{formatted_slash} (OTC)",    # EUR/USD (OTC)
+        f"{base_pair}_otc"             # EURUSD_otc
+    ]
+
+    for name in candidate_names:
+        try:
+            res = await client.get_candles(name, current_time, offset, period)
+            if res:
+                if isinstance(res, dict) and 'data' in res:
+                    candles = res['data']
+                else:
+                    candles = res
+                if candles and len(candles) >= 10:
+                    return name, candles
+        except Exception:
+            continue
+    return None, None
+
+
 async def run_price_action(client):
     """Asynchronously fetches Quotex candles and executes Price Action scans."""
     global last_signals
@@ -109,27 +135,32 @@ async def run_price_action(client):
 
     for base_pair in forex_pairs:
         try:
-            pair_name = base_pair
-            candles = await client.get_candles(pair_name, current_time, offset, period)
+            matched_name, candles = await fetch_pair_candles(
+                client, base_pair, current_time, offset, period
+            )
 
-            # Fall back to OTC if standard pair returns no candle data
-            if not candles:
-                pair_name = f"{base_pair}_otc"
-                candles = await client.get_candles(pair_name, current_time, offset, period)
-
-            if not candles:
-                print(f"No candles returned for {base_pair} / {pair_name}", flush=True)
-                continue
-
-            if len(candles) < 25:
-                print(f"Insufficient candles for {pair_name}: count={len(candles)}", flush=True)
+            if not candles or len(candles) < 20:
+                print(f"No active candle stream for {base_pair}", flush=True)
                 continue
 
             df = pd.DataFrame(candles)
-            df.rename(
-                columns={'max': 'High', 'min': 'Low', 'open': 'Open', 'close': 'Close'},
-                inplace=True
-            )
+            
+            # Map column names dynamically
+            col_map = {}
+            for col in df.columns:
+                c_low = str(col).lower()
+                if c_low in ['high', 'max']:
+                    col_map[col] = 'High'
+                elif c_low in ['low', 'min']:
+                    col_map[col] = 'Low'
+                elif c_low == 'open':
+                    col_map[col] = 'Open'
+                elif c_low == 'close':
+                    col_map[col] = 'Close'
+            df.rename(columns=col_map, inplace=True)
+
+            if not {'High', 'Low', 'Open', 'Close'}.issubset(df.columns):
+                continue
 
             # --- 1. Dynamic Support & Resistance ---
             df['Support'] = df['Low'].shift(1).rolling(window=20).min()
@@ -176,35 +207,35 @@ async def run_price_action(client):
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
 
-            print(f"Scanning {pair_name} | Price: {curr_close:.5f} | Engine Active", flush=True)
+            print(f"Scanning {matched_name} | Price: {curr_close:.5f} | PA Engine Active", flush=True)
 
-            curr_last = last_signals.get(pair_name, None)
+            curr_last = last_signals.get(matched_name, None)
 
             # --- 4. Signal Trigger Logic ---
             if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
-                    send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Engulfing")
-                    last_signals[pair_name] = "CALL"
+                    send_signal(matched_name, "CALL", "1 Min", "Support + Bullish Engulfing")
+                    last_signals[matched_name] = "CALL"
                 elif bullish_pinbar.iloc[-1]:
-                    send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Pin Bar")
-                    last_signals[pair_name] = "CALL"
+                    send_signal(matched_name, "CALL", "1 Min", "Support + Bullish Pin Bar")
+                    last_signals[matched_name] = "CALL"
                 elif bullish_pressure.iloc[-1]:
-                    send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Pressure")
-                    last_signals[pair_name] = "CALL"
+                    send_signal(matched_name, "CALL", "1 Min", "Support + Bullish Pressure")
+                    last_signals[matched_name] = "CALL"
 
             elif at_resistance and curr_last != "PUT":
                 if bearish_engulfing.iloc[-1]:
-                    send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
-                    last_signals[pair_name] = "PUT"
+                    send_signal(matched_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
+                    last_signals[matched_name] = "PUT"
                 elif bearish_pinbar.iloc[-1]:
-                    send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
-                    last_signals[pair_name] = "PUT"
+                    send_signal(matched_name, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
+                    last_signals[matched_name] = "PUT"
                 elif bearish_pressure.iloc[-1]:
-                    send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
-                    last_signals[pair_name] = "PUT"
+                    send_signal(matched_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
+                    last_signals[matched_name] = "PUT"
 
             elif not at_support and not at_resistance:
-                last_signals[pair_name] = None
+                last_signals[matched_name] = None
 
             await asyncio.sleep(0.3)
 
@@ -263,7 +294,6 @@ def start_bot_thread():
     asyncio.run(async_run_bot())
 
 
-# Launch background thread
 bot_thread = threading.Thread(target=start_bot_thread)
 bot_thread.daemon = True
 bot_thread.start()
