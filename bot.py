@@ -29,8 +29,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
 # --- Quotex Account Credentials & Session ---
-QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', '')
-QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', '')
+QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'user@example.com')
+QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'dummy_pass')
 QUOTEX_COOKIE = os.environ.get('QUOTEX_COOKIE', '')
 USER_AGENT = os.environ.get(
     'USER_AGENT',
@@ -175,7 +175,6 @@ async def run_price_action(client):
             curr_last = last_signals.get(pair_name, None)
 
             # --- 4. Signal Trigger Evaluation ---
-            # CALL Signals (Support Zone)
             if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
                     send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Engulfing")
@@ -187,7 +186,6 @@ async def run_price_action(client):
                     send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Pressure")
                     last_signals[pair_name] = "CALL"
 
-            # PUT Signals (Resistance Zone)
             elif at_resistance and curr_last != "PUT":
                 if bearish_engulfing.iloc[-1]:
                     send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
@@ -199,7 +197,6 @@ async def run_price_action(client):
                     send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
                     last_signals[pair_name] = "PUT"
 
-            # Reset signal status when price leaves the zone
             elif not at_support and not at_resistance:
                 last_signals[pair_name] = None
 
@@ -210,15 +207,18 @@ async def run_price_action(client):
 
 
 async def async_run_bot():
-    """Main asynchronous loop bypassing Cloudflare WAF via direct cookies."""
+    """Main asynchronous loop bypassing Cloudflare WAF via direct session override."""
     print("[INIT] Connecting to Quotex WebSocket Gateway via Direct Session...")
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # Initialize Quotex client without credentials to avoid hitting login.py scrape
-    client = Quotex()
+    # 1. Initialize with email/password parameters to satisfy __init__
+    client = Quotex(
+        email=QUOTEX_EMAIL or "user@example.com",
+        password=QUOTEX_PASSWORD or "dummy_pass"
+    )
 
-    # Inject headers and authentication cookies directly into the underlying session
+    # 2. Inject session cookies & headers directly into internal HTTP session
     if hasattr(client, 'api'):
         if hasattr(client.api, 'session'):
             client.api.session.headers.update({
@@ -235,12 +235,14 @@ async def async_run_bot():
         if 'laravel_session' in parsed_cookies:
             client.api.token = parsed_cookies['laravel_session']
 
-    try:
-        connected, reason = await client.connect()
-    except Exception as e:
-        print(f"[WARN] Direct connect fallback: {e}")
-        connected = False
-        reason = str(e)
+        # 3. Bypass the scraping authenticate() method which causes HTTP 403
+        async def bypass_authenticate():
+            return True, "Authenticated via Session Cookie"
+
+        client.api.authenticate = bypass_authenticate
+
+    # 4. Connect directly to WebSocket
+    connected, reason = await client.connect()
 
     if not connected and not getattr(client, 'check_connect', False):
         print(f"[ERROR] Connection to Quotex failed: {reason}")
