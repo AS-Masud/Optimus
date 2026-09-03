@@ -19,7 +19,7 @@ PUSHER_SECRET = '0ab61f388d482d06c232'
 TELEGRAM_BOT_TOKEN = '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4' 
 TELEGRAM_CHAT_ID = '-1004489990906'
 
-# --- 2. Pusher Client ---
+# --- 2. Pusher Client Setup ---
 pusher_client = pusher.Pusher(
     app_id=PUSHER_APP_ID,
     key=PUSHER_KEY,
@@ -57,6 +57,7 @@ last_signals = {}
 def send_signal(pair, direction, tf, strategy_name):
     print(f"\n✅ SIGNAL DETECTED: {pair} -> {direction} ({strategy_name})")
     
+    # 1. Send signal to Web Dashboard (Pusher)
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
             'pair': pair,
@@ -67,6 +68,7 @@ def send_signal(pair, direction, tf, strategy_name):
     except Exception as e:
         print(f"   -> ❌ Pusher error: {e}")
     
+    # 2. Send signal to Telegram Channel
     try:
         message = f"🚨 *Quotex Trading Signal!*\n\n💱 Currency: {pair}\n📈 Direction: *{direction}* (CALL/PUT)\n⏱ Timeframe: {tf}\n🧠 Strategy: {strategy_name}"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -92,6 +94,7 @@ def analyze_market():
     
     for yahoo_symbol, display_name in forex_pairs.items():
         try:
+            # Download 1-minute data
             df = yf.download(yahoo_symbol, period='1d', interval='1m', progress=False)
             
             if df.empty or len(df) < 30:
@@ -116,12 +119,11 @@ def analyze_market():
             df['Prev_Open'] = df['Open'].shift(1)
             df['Prev_Close'] = df['Close'].shift(1)
             
-            # Bullish Engulfing
+            # Bullish & Bearish Engulfing Logic
             bullish_engulfing = (df['Prev_Close'] < df['Prev_Open']) & (df['Close'] > df['Open']) & (df['Close'] > df['Prev_Open']) & (df['Open'] < df['Prev_Close'])
-            # Bearish Engulfing
             bearish_engulfing = (df['Prev_Close'] > df['Prev_Open']) & (df['Close'] < df['Open']) & (df['Close'] < df['Prev_Open']) & (df['Open'] > df['Prev_Close'])
             
-            # Pin Bar (Hammer / Shooting Star)
+            # Pin Bar Logic (Hammer / Shooting Star)
             body = abs(df['Close'] - df['Open'])
             lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
             upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
@@ -129,7 +131,7 @@ def analyze_market():
             bullish_pinbar = (lower_wick > (2 * body)) & (upper_wick < body)
             bearish_pinbar = (upper_wick > (2 * body)) & (lower_wick < body)
 
-            # --- Latest Values ---
+            # --- Latest Market Values ---
             curr_low = float(df['Low'].iloc[-1])
             curr_high = float(df['High'].iloc[-1])
             lower_bb = float(df['Lower_BB'].iloc[-1])
@@ -169,11 +171,12 @@ def analyze_market():
                     send_signal(display_name, "PUT", "1 Min", "Price Action (Bearish)")
                     last_signals[display_name] = "PUT"
             
-            # Reset Logic (Ready for a new signal once price enters inside the bands)
+            # Reset Logic (Ready for a new signal once price enters safely inside the bands)
             elif lower_bb < float(df['Close'].iloc[-1]) < upper_bb:
                 last_signals[display_name] = None 
 
-            time.sleep(2) # Avoid IP ban
+            # Delay to prevent Yahoo Finance IP Ban (Total ~40 seconds for 20 pairs)
+            time.sleep(2) 
 
         except Exception as e:
             print(f"Error on {display_name}: {e}")
@@ -182,8 +185,8 @@ def run_bot():
     print("🤖 Ultimate Hybrid Quotex Bot Started (BB + MACD + Price Action, 20 Pairs)!")
     while True:
         analyze_market()
-        print("--- Waiting 60 seconds for next 1-minute candle ---")
-        time.sleep(60)
+        print("--- Waiting 20 seconds to complete the 1-minute cycle ---")
+        time.sleep(20) # Optimized from 60 to 20 for perfect 1-minute loops
 
 # =====================================================================
 # 🚨 GUNICORN FIX: Start the background thread OUTSIDE if __name__ == "__main__"
