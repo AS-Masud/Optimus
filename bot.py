@@ -1,15 +1,12 @@
 import os
 import time
-import asyncio
 import threading
 import pandas as pd
 import requests
 import pusher
 from flask import Flask
-from pyquotex.stable_api import Quotex
-import pyquotex.api as quotex_api_module
 
-# --- Flask Server Setup (Keeps Render Web Service alive 24/7) ---
+# --- Flask Web Server ---
 app = Flask(__name__)
 
 # --- Pusher Setup ---
@@ -29,60 +26,44 @@ pusher_client = pusher.Pusher(
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- Quotex Account Credentials & Session ---
-QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'user@example.com')
-QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'dummy_pass')
-QUOTEX_COOKIE = os.environ.get('QUOTEX_COOKIE', '')
-USER_AGENT = os.environ.get(
-    'USER_AGENT',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
-)
+# --- TwelveData API Key (Sign up for free at twelvedata.com) ---
+TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY', '31c5e6f950c44a41a06b90dc6a57f8a2')
 
-# --- Active Currency Pairs ---
+# --- Highly Liquid Forex Pairs (Slash format for TwelveData) ---
 forex_pairs = [
-    "EURUSD", "GBPJPY", "USDJPY", "AUDJPY", "EURJPY",
-    "AUDCAD", "CADJPY", "CHFJPY", "EURAUD", "GBPCAD",
-    "AUDCHF", "EURCAD", "EURCHF", "GBPUSD", "USDCAD"
+    "EUR/USD", "GBP/JPY", "USD/JPY", "AUD/JPY", "EUR/JPY",
+    "GBP/USD", "USD/CAD", "AUD/USD", "EUR/GBP"
 ]
 
 last_signals = {}
 
 
-def parse_cookies(cookie_str):
-    """Converts a raw cookie string into a dictionary."""
-    cookie_dict = {}
-    if cookie_str:
-        for item in cookie_str.split(';'):
-            item = item.strip()
-            if '=' in item:
-                key, val = item.split('=', 1)
-                cookie_dict[key] = val
-    return cookie_dict
+def send_signal(pair, direction, tf, strategy_name, price):
+    """Sends trading signal to Pusher and Telegram."""
+    clean_pair = pair.replace("/", "")
+    print(f"\n[HIGH-PROBABILITY SIGNAL] {clean_pair} -> {direction} @ {price:.5f}", flush=True)
 
-
-def send_signal(pair, direction, tf, strategy_name):
-    """Dispatches trading signals to Pusher Dashboard and Telegram Channel."""
-    print(f"\n[SIGNAL] {pair} -> {direction} ({strategy_name})", flush=True)
-
-    # 1. Pusher Dashboard Trigger
+    # 1. Pusher Notification
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
-            'pair': pair,
+            'pair': clean_pair,
             'direction': direction,
             'timeframe': tf,
-            'strategy': strategy_name
+            'strategy': strategy_name,
+            'price': price
         })
     except Exception as e:
-        print(f"   -> Pusher Error: {e}", flush=True)
+        print(f"Pusher error: {e}", flush=True)
 
-    # 2. Telegram Message Alert
+    # 2. Telegram Alert
     try:
         message = (
-            f"🚨 *Quotex Pure Price Action Signal!*\n\n"
-            f"💱 *Pair:* {pair}\n"
-            f"📈 *Direction:* {direction} (CALL/PUT)\n"
-            f"⏱ *Timeframe:* {tf}\n"
-            f"🧠 *Trigger:* {strategy_name}"
+            f"🎯 *High Probability PA Signal!*\n\n"
+            f"💱 *Pair:* {clean_pair}\n"
+            f"📈 *Direction:* {direction} (CALL / PUT)\n"
+            f"⏱ *Expiration:* {tf}\n"
+            f"💵 *Entry Price:* {price:.5f}\n"
+            f"🧠 *Conditions:* {strategy_name}"
         )
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -90,243 +71,117 @@ def send_signal(pair, direction, tf, strategy_name):
             'text': message,
             'parse_mode': 'Markdown'
         }
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"   -> Telegram API Failed: {response.status_code} - {response.text}", flush=True)
-        else:
-            print("   -> Telegram alert sent successfully.", flush=True)
+        requests.post(url, json=payload, timeout=8)
     except Exception as e:
-        print(f"   -> Telegram Network Exception: {e}", flush=True)
+        print(f"Telegram alert error: {e}", flush=True)
 
 
-async def retrieve_asset_candles(client, asset, period=60):
-    """Activates the asset chart and retrieves candles from Quotex cache or direct response."""
-    current_time = int(time.time())
-    offset = 3600  # 1 hour lookback (60 candles)
-
-    # Try both standard and OTC variants
-    candidates = [f"{asset}_otc", asset]
-
-    for sym in candidates:
-        try:
-            # 1. Ensure asset channel is opened in websocket
-            if hasattr(client, 'open_asset'):
-                try:
-                    await client.open_asset(sym)
-                except Exception:
-                    pass
-
-            # 2. Fire candles fetch call
-            try:
-                task = client.get_candles(sym, current_time, offset, period)
-                res = await asyncio.wait_for(task, timeout=4.0)
-            except Exception:
-                res = None
-
-            candles = None
-            if isinstance(res, list) and len(res) > 0:
-                candles = res
-            elif isinstance(res, dict):
-                candles = res.get('data') or res.get('candles')
-
-            # 3. Check memory store if socket response was stored internally
-            if not candles and hasattr(client, 'api') and hasattr(client.api, 'candles'):
-                store = getattr(client.api.candles, 'candles_data', {})
-                if sym in store and len(store[sym]) > 0:
-                    candles = list(store[sym].values())
-
-            if candles and len(candles) >= 15:
-                return sym, candles
-
-        except Exception:
-            continue
-
-    return None, None
+def calculate_rsi(series, period=14):
+    """Calculates relative strength index."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 
-async def run_price_action(client):
-    """Asynchronously evaluates market data using technical Price Action rules."""
+def scan_pair(pair):
+    """Fetches real-time candles and validates 3-layer confluence."""
     global last_signals
 
-    for base_pair in forex_pairs:
-        try:
-            matched_symbol, candles = await retrieve_asset_candles(client, base_pair, period=60)
-
-            if not candles or len(candles) < 15:
-                print(f"[SCAN] {base_pair}: Waiting for live quote stream...", flush=True)
-                continue
-
-            df = pd.DataFrame(candles)
-
-            # Normalize column names
-            col_map = {}
-            for col in df.columns:
-                c_low = str(col).lower()
-                if c_low in ['high', 'max']:
-                    col_map[col] = 'High'
-                elif c_low in ['low', 'min']:
-                    col_map[col] = 'Low'
-                elif c_low == 'open':
-                    col_map[col] = 'Open'
-                elif c_low == 'close':
-                    col_map[col] = 'Close'
-            df.rename(columns=col_map, inplace=True)
-
-            if not {'High', 'Low', 'Open', 'Close'}.issubset(df.columns):
-                continue
-
-            # --- 1. Dynamic Support & Resistance ---
-            df['Support'] = df['Low'].shift(1).rolling(window=15).min()
-            df['Resistance'] = df['High'].shift(1).rolling(window=15).max()
-
-            # --- 2. Candlestick Properties ---
-            df['Prev_Open'] = df['Open'].shift(1)
-            df['Prev_Close'] = df['Close'].shift(1)
-
-            body = (df['Close'] - df['Open']).abs()
-            total_range = df['High'] - df['Low']
-
-            # --- 3. Patterns Recognition ---
-            bullish_engulfing = (
-                (df['Prev_Close'] < df['Prev_Open']) &
-                (df['Close'] > df['Open']) &
-                (df['Close'] > df['Prev_Open']) &
-                (df['Open'] < df['Prev_Close'])
-            )
-
-            bearish_engulfing = (
-                (df['Prev_Close'] > df['Prev_Open']) &
-                (df['Close'] < df['Open']) &
-                (df['Close'] < df['Prev_Open']) &
-                (df['Open'] > df['Prev_Close'])
-            )
-
-            lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
-            upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
-
-            bullish_pinbar = (lower_wick > (2 * body)) & (upper_wick < (body * 0.5))
-            bearish_pinbar = (upper_wick > (2 * body)) & (lower_wick < (body * 0.5))
-
-            bullish_pressure = (df['Close'] > df['Open']) & (body > (total_range * 0.5)) & (upper_wick < (body * 0.2))
-            bearish_pressure = (df['Open'] > df['Close']) & (body > (total_range * 0.5)) & (lower_wick < (body * 0.2))
-
-            curr_low = float(df['Low'].iloc[-1])
-            curr_high = float(df['High'].iloc[-1])
-            curr_close = float(df['Close'].iloc[-1])
-            support = float(df['Support'].iloc[-1])
-            resistance = float(df['Resistance'].iloc[-1])
-
-            buffer = curr_close * 0.0002
-            at_support = curr_low <= (support + buffer)
-            at_resistance = curr_high >= (resistance - buffer)
-
-            print(f"[ACTIVE] {matched_symbol} | Close: {curr_close:.5f} | Supp: {support:.5f} | Res: {resistance:.5f}", flush=True)
-
-            curr_last = last_signals.get(matched_symbol, None)
-
-            # --- 4. Signal Trigger Logic ---
-            if at_support and curr_last != "CALL":
-                if bullish_engulfing.iloc[-1]:
-                    send_signal(matched_symbol, "CALL", "1 Min", "Support + Bullish Engulfing")
-                    last_signals[matched_symbol] = "CALL"
-                elif bullish_pinbar.iloc[-1]:
-                    send_signal(matched_symbol, "CALL", "1 Min", "Support + Bullish Pin Bar")
-                    last_signals[matched_symbol] = "CALL"
-                elif bullish_pressure.iloc[-1]:
-                    send_signal(matched_symbol, "CALL", "1 Min", "Support + Bullish Pressure")
-                    last_signals[matched_symbol] = "CALL"
-
-            elif at_resistance and curr_last != "PUT":
-                if bearish_engulfing.iloc[-1]:
-                    send_signal(matched_symbol, "PUT", "1 Min", "Resistance + Bearish Engulfing")
-                    last_signals[matched_symbol] = "PUT"
-                elif bearish_pinbar.iloc[-1]:
-                    send_signal(matched_symbol, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
-                    last_signals[matched_symbol] = "PUT"
-                elif bearish_pressure.iloc[-1]:
-                    send_signal(matched_symbol, "PUT", "1 Min", "Resistance + Bearish Pressure")
-                    last_signals[matched_symbol] = "PUT"
-
-            elif not at_support and not at_resistance:
-                last_signals[matched_symbol] = None
-
-            await asyncio.sleep(0.3)
-
-        except Exception as e:
-            print(f"[ERROR] Pair scan exception on {base_pair}: {e}", flush=True)
-
-
-async def async_run_bot():
-    """Bypasses Cloudflare login scrapers using module-level method overrides."""
-    print("[INIT] Connecting to Quotex WebSocket Gateway via Session...", flush=True)
-
-    parsed_cookies = parse_cookies(QUOTEX_COOKIE)
-
-    async def bypassed_authenticate(self):
-        if hasattr(self, 'session') and self.session:
-            self.session.headers.update({
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://market-qx.info/"
-            })
-            for k, v in parsed_cookies.items():
-                self.session.cookies.set(k, v)
-
-        if 'laravel_session' in parsed_cookies:
-            self.token = parsed_cookies['laravel_session']
-
-        return True, "Authenticated via Session"
-
-    if hasattr(quotex_api_module, 'QuotexAPI'):
-        quotex_api_module.QuotexAPI.authenticate = bypassed_authenticate
-
-    client = Quotex(
-        email=QUOTEX_EMAIL or "user@example.com",
-        password=QUOTEX_PASSWORD or "dummy_pass"
+    url = (
+        f"https://api.twelvedata.com/time_series?"
+        f"symbol={pair}&interval=1min&outputsize=45&apikey={TWELVE_DATA_API_KEY}"
     )
 
-    connected, reason = await client.connect()
-
-    if not connected and not getattr(client, 'check_connect', False):
-        print(f"[ERROR] Connection to Quotex failed: {reason}", flush=True)
-        return
-
-    # Activate WebSocket handshake by initiating practice balance
     try:
-        if hasattr(client, 'change_account'):
-            await client.change_account("PRACTICE")
-            await asyncio.sleep(1)
-        if hasattr(client, 'get_balance'):
-            balance = await client.get_balance()
-            print(f"[ACCOUNT] Practice Balance Loaded: {balance}", flush=True)
-    except Exception as e:
-        print(f"[ACCOUNT] Account check info: {e}", flush=True)
+        response = requests.get(url, timeout=6)
+        res_json = response.json()
 
-    print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...", flush=True)
+        if "values" not in res_json:
+            return
+
+        # Prepare DataFrame
+        df = pd.DataFrame(res_json["values"])
+        df = df.iloc[::-1].reset_index(drop=True)  # Chronological order
+
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['close'] = df['close'].astype(float)
+
+        # 1. Dynamic Support & Resistance (Last 20 Candles)
+        df['Support'] = df['low'].shift(1).rolling(window=20).min()
+        df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
+
+        # 2. RSI Indicator
+        df['RSI'] = calculate_rsi(df['close'], 14)
+
+        # 3. EMA 50 Trend Direction
+        df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+
+        # Candlestick Shapes
+        body = (df['close'] - df['open']).abs()
+        lower_wick = df[['open', 'close']].min(axis=1) - df['low']
+        upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
+
+        bullish_rejection = lower_wick > (1.8 * body)
+        bearish_rejection = upper_wick > (1.8 * body)
+
+        curr_close = df['close'].iloc[-1]
+        curr_low = df['low'].iloc[-1]
+        curr_high = df['high'].iloc[-1]
+        support = df['Support'].iloc[-1]
+        resistance = df['Resistance'].iloc[-1]
+        rsi = df['RSI'].iloc[-1]
+        ema = df['EMA50'].iloc[-1]
+
+        buffer = curr_close * 0.00015
+        at_support = curr_low <= (support + buffer)
+        at_resistance = curr_high >= (resistance - buffer)
+
+        curr_last = last_signals.get(pair, None)
+
+        # --- High Win-Rate Setup Logic ---
+
+        # 1. CALL Criteria: At Support + RSI Oversold (<38) + Strong Lower Wick Rejection
+        if at_support and rsi < 38 and bullish_rejection.iloc[-1] and curr_last != "CALL":
+            strategy = "Support Bounce + RSI Oversold + Hammer Rejection"
+            send_signal(pair, "CALL", "1 Min", strategy, curr_close)
+            last_signals[pair] = "CALL"
+
+        # 2. PUT Criteria: At Resistance + RSI Overbought (>62) + Strong Upper Wick Rejection
+        elif at_resistance and rsi > 62 and bearish_rejection.iloc[-1] and curr_last != "PUT":
+            strategy = "Resistance Rejection + RSI Overbought + Shooting Star"
+            send_signal(pair, "PUT", "1 Min", strategy, curr_close)
+            last_signals[pair] = "PUT"
+
+        elif not at_support and not at_resistance:
+            last_signals[pair] = None
+
+    except Exception as err:
+        print(f"Error parsing {pair}: {err}", flush=True)
+
+
+def background_scanner():
+    """Main continuous scanner loop."""
+    print("[ACTIVE] Real-time High Probability PA Bot Running...", flush=True)
     while True:
-        try:
-            print("[SCAN CYCLE] Evaluating currency pairs...", flush=True)
-            await run_price_action(client)
-            await asyncio.sleep(5)
-        except Exception as err:
-            print(f"[LOOP EXCEPTION] Engine error: {err}", flush=True)
-            await asyncio.sleep(3)
+        for pair in forex_pairs:
+            scan_pair(pair)
+            time.sleep(1.2)  # Avoid rate limit on free API key
+        time.sleep(3)
 
 
-def start_bot_thread():
-    """Runs the asyncio loop inside a background worker thread."""
-    asyncio.run(async_run_bot())
-
-
-# Launch background thread
-bot_thread = threading.Thread(target=start_bot_thread)
-bot_thread.daemon = True
-bot_thread.start()
+# Run background scanner thread
+scanner_thread = threading.Thread(target=background_scanner)
+scanner_thread.daemon = True
+scanner_thread.start()
 
 
 @app.route('/')
-def health_check():
-    return "Quotex Real-Time PA Engine is alive and running 24/7!", 200
+def health():
+    return "Real-Time Trading Bot is Healthy and Active!", 200
 
 
 if __name__ == "__main__":
