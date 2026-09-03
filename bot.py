@@ -100,28 +100,40 @@ def send_signal(pair, direction, tf, strategy_name):
 
 
 async def fetch_pair_candles(client, base_pair, current_time, offset, period):
-    """Tries multiple naming formats for live and OTC assets."""
+    """Subscribes to asset stream before retrieving historical candle data."""
     formatted_slash = f"{base_pair[:3]}/{base_pair[3:]}"
     candidate_names = [
         base_pair,                     # EURUSD
+        f"{base_pair}_otc",            # EURUSD_otc
         formatted_slash,               # EUR/USD
         f"{base_pair} (OTC)",          # EURUSD (OTC)
-        f"{formatted_slash} (OTC)",    # EUR/USD (OTC)
-        f"{base_pair}_otc"             # EURUSD_otc
+        f"{formatted_slash} (OTC)"     # EUR/USD (OTC)
     ]
 
     for name in candidate_names:
         try:
+            # Subscribe to the asset's live WebSocket feed
+            if hasattr(client, 'open_asset'):
+                try:
+                    await client.open_asset(name)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
             res = await client.get_candles(name, current_time, offset, period)
             if res:
                 if isinstance(res, dict) and 'data' in res:
                     candles = res['data']
+                elif isinstance(res, dict) and 'candles' in res:
+                    candles = res['candles']
                 else:
                     candles = res
-                if candles and len(candles) >= 10:
+
+                if candles and isinstance(candles, list) and len(candles) >= 10:
                     return name, candles
         except Exception:
             continue
+
     return None, None
 
 
@@ -139,13 +151,13 @@ async def run_price_action(client):
                 client, base_pair, current_time, offset, period
             )
 
-            if not candles or len(candles) < 20:
-                print(f"No active candle stream for {base_pair}", flush=True)
+            if not candles or len(candles) < 15:
+                print(f"Waiting for live feed: {base_pair}", flush=True)
                 continue
 
             df = pd.DataFrame(candles)
-            
-            # Map column names dynamically
+
+            # Standardize column naming
             col_map = {}
             for col in df.columns:
                 c_low = str(col).lower()
@@ -249,6 +261,7 @@ async def async_run_bot():
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
+    # Monkey-patch authenticate to skip Cloudflare-guarded login scraping
     async def bypassed_authenticate(self):
         if hasattr(self, 'session') and self.session:
             self.session.headers.update({
@@ -278,6 +291,13 @@ async def async_run_bot():
         print(f"[ERROR] Connection to Quotex failed: {reason}", flush=True)
         return
 
+    # Select DEMO account mode to open feed channel
+    try:
+        if hasattr(client, 'change_account'):
+            await client.change_account("DEMO")
+    except Exception as e:
+        print(f"[ACCOUNT] Note on account mode switch: {e}", flush=True)
+
     print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...", flush=True)
     while True:
         try:
@@ -294,6 +314,7 @@ def start_bot_thread():
     asyncio.run(async_run_bot())
 
 
+# Launch background worker
 bot_thread = threading.Thread(target=start_bot_thread)
 bot_thread.daemon = True
 bot_thread.start()
