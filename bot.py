@@ -7,6 +7,7 @@ import requests
 import pusher
 from flask import Flask
 from pyquotex.stable_api import Quotex
+import pyquotex.api as quotex_api_module
 
 # --- Flask Server Setup (Keeps Render Web Service alive 24/7) ---
 app = Flask(__name__)
@@ -48,7 +49,7 @@ last_signals = {}
 
 
 def parse_cookies(cookie_str):
-    """Converts a raw cookie string into a clean dictionary."""
+    """Converts a raw cookie string into a dictionary."""
     cookie_dict = {}
     if cookie_str:
         for item in cookie_str.split(';'):
@@ -99,16 +100,16 @@ def send_signal(pair, direction, tf, strategy_name):
 
 
 async def run_price_action(client):
-    """Asynchronously fetches Quotex candles and executes the Price Action rules."""
+    """Asynchronously fetches Quotex candles and executes Price Action scans."""
     global last_signals
 
     for base_pair in forex_pairs:
         try:
             pair_name = base_pair
-            # 60s (1 min) timeframe, 30 candles
+            # 60s timeframe, 30 periods
             candles = await client.get_candles(pair_name, 60, 30)
 
-            # If standard asset returns no data (market closed), fall back to OTC
+            # Fall back to OTC if regular asset data is not available
             if not candles:
                 pair_name = f"{base_pair}_otc"
                 candles = await client.get_candles(pair_name, 60, 30)
@@ -116,18 +117,17 @@ async def run_price_action(client):
             if not candles or len(candles) < 25:
                 continue
 
-            # Convert to Pandas DataFrame
             df = pd.DataFrame(candles)
             df.rename(
                 columns={'max': 'High', 'min': 'Low', 'open': 'Open', 'close': 'Close'},
                 inplace=True
             )
 
-            # --- 1. Dynamic Support & Resistance (Last 20 Candles) ---
+            # --- 1. Dynamic Support & Resistance ---
             df['Support'] = df['Low'].shift(1).rolling(window=20).min()
             df['Resistance'] = df['High'].shift(1).rolling(window=20).max()
 
-            # --- 2. Candlestick Dimensional Properties ---
+            # --- 2. Candlestick Properties ---
             df['Prev_Open'] = df['Open'].shift(1)
             df['Prev_Close'] = df['Close'].shift(1)
 
@@ -158,14 +158,12 @@ async def run_price_action(client):
             bullish_pressure = (df['Close'] > df['Open']) & (body > (total_range * 0.5)) & (upper_wick < (body * 0.2))
             bearish_pressure = (df['Open'] > df['Close']) & (body > (total_range * 0.5)) & (lower_wick < (body * 0.2))
 
-            # Current price metrics
             curr_low = float(df['Low'].iloc[-1])
             curr_high = float(df['High'].iloc[-1])
             curr_close = float(df['Close'].iloc[-1])
             support = float(df['Support'].iloc[-1])
             resistance = float(df['Resistance'].iloc[-1])
 
-            # Buffer threshold (0.02%)
             buffer = curr_close * 0.0002
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
@@ -174,7 +172,7 @@ async def run_price_action(client):
 
             curr_last = last_signals.get(pair_name, None)
 
-            # --- 4. Signal Trigger Evaluation ---
+            # --- 4. Signal Trigger Logic ---
             if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
                     send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Engulfing")
@@ -207,40 +205,37 @@ async def run_price_action(client):
 
 
 async def async_run_bot():
-    """Main asynchronous loop bypassing Cloudflare WAF via direct session override."""
-    print("[INIT] Connecting to Quotex WebSocket Gateway via Direct Session...")
+    """Bypasses Cloudflare login scrapers using module-level method overrides."""
+    print("[INIT] Connecting to Quotex WebSocket Gateway via Session...")
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # 1. Initialize client
-    client = Quotex(
-        email=QUOTEX_EMAIL or "user@example.com",
-        password=QUOTEX_PASSWORD or "dummy_pass"
-    )
-
-    # 2. Safely apply headers and session cookies
-    api_instance = getattr(client, 'api', None)
-    if api_instance is not None:
-        session_obj = getattr(api_instance, 'session', None)
-        if session_obj is not None:
-            session_obj.headers.update({
+    # 1. Direct monkey-patch on QuotexAPI class to prevent executing login.py
+    async def bypassed_authenticate(self):
+        if hasattr(self, 'session') and self.session:
+            self.session.headers.update({
                 "User-Agent": USER_AGENT,
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://market-qx.info/"
             })
             for k, v in parsed_cookies.items():
-                session_obj.cookies.set(k, v)
+                self.session.cookies.set(k, v)
 
-        if hasattr(api_instance, 'custom_cookies'):
-            api_instance.custom_cookies = QUOTEX_COOKIE
+        if 'laravel_session' in parsed_cookies:
+            self.token = parsed_cookies['laravel_session']
 
-        # Safely override the scraping authenticate method to avoid HTTP 403
-        async def bypass_authenticate():
-            return True, "Authenticated via Session Cookie"
+        return True, "Authenticated via Session"
 
-        api_instance.authenticate = bypass_authenticate
+    if hasattr(quotex_api_module, 'QuotexAPI'):
+        quotex_api_module.QuotexAPI.authenticate = bypassed_authenticate
 
-    # 3. Direct WebSocket Connect
+    # 2. Instantiate client
+    client = Quotex(
+        email=QUOTEX_EMAIL or "user@example.com",
+        password=QUOTEX_PASSWORD or "dummy_pass"
+    )
+
+    # 3. Connect to WebSocket
     connected, reason = await client.connect()
 
     if not connected and not getattr(client, 'check_connect', False):
@@ -258,11 +253,11 @@ async def async_run_bot():
 
 
 def start_bot_thread():
-    """Runs the asyncio loop in a separate background daemon thread."""
+    """Runs the asyncio loop inside a background worker thread."""
     asyncio.run(async_run_bot())
 
 
-# Launch background worker thread
+# Launch background thread
 bot_thread = threading.Thread(target=start_bot_thread)
 bot_thread.daemon = True
 bot_thread.start()
