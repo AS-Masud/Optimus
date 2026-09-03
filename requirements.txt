@@ -2,4 +2,3 @@ flask
 requests
 pusher
 pandas
-git+https://github.com/cleitonleonel/pyquotex.git
