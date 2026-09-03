@@ -99,36 +99,50 @@ def send_signal(pair, direction, tf, strategy_name):
         print(f"   -> Telegram Network Exception: {e}", flush=True)
 
 
-async def get_candles_fast(client, asset, period=60):
-    """Fetches candle data with a strict 3-second timeout to avoid loop stalls."""
+async def get_candles_streamed(client, asset, period=60):
+    """Subscribes to candle stream, awaits buffer population, and extracts records."""
     current_time = int(time.time())
-    offset = 3600  # 1 hour lookback (60 candles)
+    offset = 3600
 
-    # Directly check normal pair or OTC pair only
-    for target_symbol in [asset, f"{asset}_otc"]:
+    candidates = [f"{asset}_otc", asset]
+
+    for sym in candidates:
         try:
-            # 3 second strict timeout per asset
-            res = await asyncio.wait_for(
-                client.get_candles(target_symbol, current_time, offset, period),
-                timeout=3.5
-            )
+            # 1. Send subscription packet to open feed
+            if hasattr(client, 'start_candles_stream'):
+                try:
+                    await client.start_candles_stream(sym, period)
+                except Exception:
+                    pass
 
+            if hasattr(client, 'subscribe_symbol'):
+                try:
+                    await client.subscribe_symbol(sym)
+                except Exception:
+                    pass
+
+            # 2. Brief sleep to allow WebSocket server to push history into local cache
+            await asyncio.sleep(0.8)
+
+            # 3. Pull candles via standard call
+            res = await client.get_candles(sym, current_time, offset, period)
+            
             candles = None
             if isinstance(res, list) and len(res) > 0:
                 candles = res
             elif isinstance(res, dict):
                 candles = res.get('data') or res.get('candles')
 
-            # Fallback to internal library store if response is cached
+            # 4. Fallback: Check pyquotex underlying memory dictionary
             if not candles and hasattr(client, 'api') and hasattr(client.api, 'candles'):
                 cache = getattr(client.api.candles, 'candles_data', {})
-                if target_symbol in cache:
-                    candles = list(cache[target_symbol].values())
+                if sym in cache and cache[sym]:
+                    candles = list(cache[sym].values())
 
             if candles and len(candles) >= 15:
-                return target_symbol, candles
+                return sym, candles
 
-        except (asyncio.TimeoutError, Exception):
+        except Exception:
             continue
 
     return None, None
@@ -140,7 +154,7 @@ async def run_price_action(client):
 
     for base_pair in forex_pairs:
         try:
-            matched_symbol, candles = await get_candles_fast(client, base_pair, period=60)
+            matched_symbol, candles = await get_candles_streamed(client, base_pair, period=60)
 
             if not candles or len(candles) < 15:
                 print(f"[SKIP] {base_pair}: No active candle stream available", flush=True)
@@ -148,7 +162,7 @@ async def run_price_action(client):
 
             df = pd.DataFrame(candles)
 
-            # Normalize columns
+            # Normalize column names
             col_map = {}
             for col in df.columns:
                 c_low = str(col).lower()
@@ -281,7 +295,7 @@ async def async_run_bot():
         print(f"[ERROR] Connection to Quotex failed: {reason}", flush=True)
         return
 
-    # Practice mode
+    # Practice / Demo balance initialization
     try:
         if hasattr(client, 'change_account'):
             await client.change_account("PRACTICE")
@@ -304,7 +318,7 @@ def start_bot_thread():
     asyncio.run(async_run_bot())
 
 
-# Launch background worker
+# Launch background thread
 bot_thread = threading.Thread(target=start_bot_thread)
 bot_thread.daemon = True
 bot_thread.start()
