@@ -99,45 +99,41 @@ def send_signal(pair, direction, tf, strategy_name):
         print(f"   -> Telegram Network Exception: {e}", flush=True)
 
 
-async def get_candles_streamed(client, asset, period=60):
-    """Subscribes to candle stream, awaits buffer population, and extracts records."""
+async def retrieve_asset_candles(client, asset, period=60):
+    """Activates the asset chart and retrieves candles from Quotex cache or direct response."""
     current_time = int(time.time())
-    offset = 3600
+    offset = 3600  # 1 hour lookback (60 candles)
 
+    # Try both standard and OTC variants
     candidates = [f"{asset}_otc", asset]
 
     for sym in candidates:
         try:
-            # 1. Send subscription packet to open feed
-            if hasattr(client, 'start_candles_stream'):
+            # 1. Ensure asset channel is opened in websocket
+            if hasattr(client, 'open_asset'):
                 try:
-                    await client.start_candles_stream(sym, period)
+                    await client.open_asset(sym)
                 except Exception:
                     pass
 
-            if hasattr(client, 'subscribe_symbol'):
-                try:
-                    await client.subscribe_symbol(sym)
-                except Exception:
-                    pass
+            # 2. Fire candles fetch call
+            try:
+                task = client.get_candles(sym, current_time, offset, period)
+                res = await asyncio.wait_for(task, timeout=4.0)
+            except Exception:
+                res = None
 
-            # 2. Brief sleep to allow WebSocket server to push history into local cache
-            await asyncio.sleep(0.8)
-
-            # 3. Pull candles via standard call
-            res = await client.get_candles(sym, current_time, offset, period)
-            
             candles = None
             if isinstance(res, list) and len(res) > 0:
                 candles = res
             elif isinstance(res, dict):
                 candles = res.get('data') or res.get('candles')
 
-            # 4. Fallback: Check pyquotex underlying memory dictionary
+            # 3. Check memory store if socket response was stored internally
             if not candles and hasattr(client, 'api') and hasattr(client.api, 'candles'):
-                cache = getattr(client.api.candles, 'candles_data', {})
-                if sym in cache and cache[sym]:
-                    candles = list(cache[sym].values())
+                store = getattr(client.api.candles, 'candles_data', {})
+                if sym in store and len(store[sym]) > 0:
+                    candles = list(store[sym].values())
 
             if candles and len(candles) >= 15:
                 return sym, candles
@@ -154,10 +150,10 @@ async def run_price_action(client):
 
     for base_pair in forex_pairs:
         try:
-            matched_symbol, candles = await get_candles_streamed(client, base_pair, period=60)
+            matched_symbol, candles = await retrieve_asset_candles(client, base_pair, period=60)
 
             if not candles or len(candles) < 15:
-                print(f"[SKIP] {base_pair}: No active candle stream available", flush=True)
+                print(f"[SCAN] {base_pair}: Waiting for live quote stream...", flush=True)
                 continue
 
             df = pd.DataFrame(candles)
@@ -254,7 +250,7 @@ async def run_price_action(client):
             elif not at_support and not at_resistance:
                 last_signals[matched_symbol] = None
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
 
         except Exception as e:
             print(f"[ERROR] Pair scan exception on {base_pair}: {e}", flush=True)
@@ -295,12 +291,16 @@ async def async_run_bot():
         print(f"[ERROR] Connection to Quotex failed: {reason}", flush=True)
         return
 
-    # Practice / Demo balance initialization
+    # Activate WebSocket handshake by initiating practice balance
     try:
         if hasattr(client, 'change_account'):
             await client.change_account("PRACTICE")
-    except Exception:
-        pass
+            await asyncio.sleep(1)
+        if hasattr(client, 'get_balance'):
+            balance = await client.get_balance()
+            print(f"[ACCOUNT] Practice Balance Loaded: {balance}", flush=True)
+    except Exception as e:
+        print(f"[ACCOUNT] Account check info: {e}", flush=True)
 
     print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...", flush=True)
     while True:
