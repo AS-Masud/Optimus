@@ -1,25 +1,20 @@
-import pandas as pd
-import pusher
-import time
 import os
+import time
 import threading
-from flask import Flask
-import yfinance as yf
+import pandas as pd
 import requests
+import pusher
+from flask import Flask
+from pyquotex import Quotex
 
-# Flask Web Server Setup (Required to keep Render server awake 24/7)
+# --- Flask Server Setup (Keeps Render Web Service alive 24/7) ---
 app = Flask(__name__)
 
-# --- 1. API Keys & Setup ---
-PUSHER_APP_ID = '2190746'
-PUSHER_KEY = 'f6d226d63552173e92b9'
-PUSHER_SECRET = '0ab61f388d482d06c232'
+# --- Pusher Setup ---
+PUSHER_APP_ID = os.environ.get('PUSHER_APP_ID', '2190746')
+PUSHER_KEY = os.environ.get('PUSHER_KEY', 'f6d226d63552173e92b9')
+PUSHER_SECRET = os.environ.get('PUSHER_SECRET', '0ab61f388d482d06c232')
 
-# 🚨 IMPORTANT: Place your newly generated Telegram token here
-TELEGRAM_BOT_TOKEN = '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4' 
-TELEGRAM_CHAT_ID = '-1004489990906'
-
-# --- 2. Pusher Client Setup ---
 pusher_client = pusher.Pusher(
     app_id=PUSHER_APP_ID,
     key=PUSHER_KEY,
@@ -28,35 +23,28 @@ pusher_client = pusher.Pusher(
     ssl=True
 )
 
-# --- 3. Multi-Currency Quotex Forex List (20 Pairs) ---
-forex_pairs = {
-    'EURUSD=X': 'EUR/USD',
-    'GBPJPY=X': 'GBP/JPY',
-    'USDJPY=X': 'USD/JPY',
-    'AUDJPY=X': 'AUD/JPY',
-    'EURJPY=X': 'EUR/JPY',
-    'AUDCAD=X': 'AUD/CAD',
-    'CADJPY=X': 'CAD/JPY',
-    'CHFJPY=X': 'CHF/JPY',
-    'EURAUD=X': 'EUR/AUD',
-    'GBPCAD=X': 'GBP/CAD',
-    'AUDCHF=X': 'AUD/CHF',
-    'EURCAD=X': 'EUR/CAD',
-    'EURCHF=X': 'EUR/CHF',
-    'GBPUSD=X': 'GBP/USD',
-    'USDCAD=X': 'USD/CAD',
-    'AUDUSD=X': 'AUD/USD',
-    'GBPAUD=X': 'GBP/AUD',
-    'EURGBP=X': 'EUR/GBP',
-    'GBPCHF=X': 'GBP/CHF',
-    'USDCHF=X': 'USD/CHF'
-}
+# --- Telegram Bot Setup ---
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
+
+# --- Quotex Account Credentials ---
+QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'your_email@example.com')
+QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'your_password')
+
+# --- Assets List (Scans Live during regular hours, switches to OTC automatically) ---
+forex_pairs = [
+    "EURUSD", "GBPJPY", "USDJPY", "AUDJPY", "EURJPY",
+    "AUDCAD", "CADJPY", "CHFJPY", "EURAUD", "GBPCAD",
+    "AUDCHF", "EURCAD", "EURCHF", "GBPUSD", "USDCAD"
+]
 
 last_signals = {}
 
+
 def send_signal(pair, direction, tf, strategy_name):
-    print(f"\n✅ SIGNAL DETECTED: {pair} -> {direction} ({strategy_name})")
-    
+    """Dispatches trading signals to Pusher Dashboard and Telegram Channel."""
+    print(f"\n[SIGNAL] {pair} -> {direction} ({strategy_name})")
+
     # 1. Send signal to Web Dashboard (Pusher)
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
@@ -66,144 +54,175 @@ def send_signal(pair, direction, tf, strategy_name):
             'strategy': strategy_name
         })
     except Exception as e:
-        print(f"   -> ❌ Pusher error: {e}")
-    
+        print(f"   -> Pusher Error: {e}")
+
     # 2. Send signal to Telegram Channel
     try:
-        message = f"🚨 *Quotex Pure Price Action!*\n\n💱 Currency: {pair}\n📈 Direction: *{direction}* (CALL/PUT)\n⏱ Timeframe: {tf}\n🧠 Trigger: {strategy_name}"
+        message = (
+            f"🚨 *Quotex Pure Price Action Signal!*\n\n"
+            f"💱 *Pair:* {pair}\n"
+            f"📈 *Direction:* {direction} (CALL/PUT)\n"
+            f"⏱ *Timeframe:* {tf}\n"
+            f"🧠 *Trigger:* {strategy_name}"
+        )
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
             'text': message,
             'parse_mode': 'Markdown'
         }
-        
         response = requests.post(url, json=payload, timeout=10)
-        
         if response.status_code != 200:
-            print(f"   -> ❌ Telegram Failed! Code: {response.status_code}, Reason: {response.text}")
+            print(f"   -> Telegram API Failed: {response.status_code} - {response.text}")
         else:
-            print("   -> ✅ Telegram message sent successfully!")
-            
+            print("   -> Telegram alert delivered successfully.")
     except Exception as e:
-        print(f"   -> ❌ Telegram Network Error: {e}")
+        print(f"   -> Telegram Request Exception: {e}")
 
-def analyze_market():
+
+def run_price_action(client):
+    """Fetches real-time Quotex candle data and executes the Price Action engine."""
     global last_signals
-    
-    for yahoo_symbol, display_name in forex_pairs.items():
+
+    for base_pair in forex_pairs:
         try:
-            # Download 1-minute data
-            df = yf.download(yahoo_symbol, period='1d', interval='1m', progress=False)
-            
-            if df.empty or len(df) < 25:
+            # First attempt: standard regular market asset
+            pair_name = base_pair
+            candles = client.get_candles(pair_name, 60, 30)  # 30 candles on 60s timeframe
+
+            # Fallback: if regular asset has no feed (e.g. weekend/after-hours), query the OTC asset
+            if not candles:
+                pair_name = f"{base_pair}_otc"
+                candles = client.get_candles(pair_name, 60, 30)
+
+            if not candles or len(candles) < 25:
                 continue
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+            # Convert fetched candles to a Pandas DataFrame
+            df = pd.DataFrame(candles)
+
+            # Standardize OHLC column headers across pyquotex versions
+            df.rename(
+                columns={'max': 'High', 'min': 'Low', 'open': 'Open', 'close': 'Close'},
+                inplace=True
+            )
 
             # --- 1. Dynamic Support & Resistance (Last 20 Candles) ---
-            # Shifting by 1 so current candle doesn't affect established S/R
             df['Support'] = df['Low'].shift(1).rolling(window=20).min()
             df['Resistance'] = df['High'].shift(1).rolling(window=20).max()
 
-            # --- 2. Candlestick Properties ---
+            # --- 2. Candlestick Dimensional Properties ---
             df['Prev_Open'] = df['Open'].shift(1)
             df['Prev_Close'] = df['Close'].shift(1)
-            
-            body = abs(df['Close'] - df['Open'])
+
+            body = (df['Close'] - df['Open']).abs()
             total_range = df['High'] - df['Low']
-            
-            # --- 3. Pattern: Engulfing ---
-            bullish_engulfing = (df['Prev_Close'] < df['Prev_Open']) & (df['Close'] > df['Open']) & (df['Close'] > df['Prev_Open']) & (df['Open'] < df['Prev_Close'])
-            bearish_engulfing = (df['Prev_Close'] > df['Prev_Open']) & (df['Close'] < df['Open']) & (df['Close'] < df['Prev_Open']) & (df['Open'] > df['Prev_Close'])
-            
-            # --- 4. Pattern: Pin Bar (Rejection) ---
+
+            # --- 3. Patterns Recognition ---
+            bullish_engulfing = (
+                (df['Prev_Close'] < df['Prev_Open']) &
+                (df['Close'] > df['Open']) &
+                (df['Close'] > df['Prev_Open']) &
+                (df['Open'] < df['Prev_Close'])
+            )
+
+            bearish_engulfing = (
+                (df['Prev_Close'] > df['Prev_Open']) &
+                (df['Close'] < df['Open']) &
+                (df['Close'] < df['Prev_Open']) &
+                (df['Open'] > df['Prev_Close'])
+            )
+
             lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
             upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
+
             bullish_pinbar = (lower_wick > (2 * body)) & (upper_wick < (body * 0.5))
             bearish_pinbar = (upper_wick > (2 * body)) & (lower_wick < (body * 0.5))
 
-            # --- 5. NEW: Candle Pressure (Momentum) ---
-            # Bullish Pressure: Green candle, body is > 50% of range, very small upper wick (buyers in full control)
             bullish_pressure = (df['Close'] > df['Open']) & (body > (total_range * 0.5)) & (upper_wick < (body * 0.2))
-            
-            # Bearish Pressure: Red candle, body is > 50% of range, very small lower wick (sellers in full control)
             bearish_pressure = (df['Open'] > df['Close']) & (body > (total_range * 0.5)) & (lower_wick < (body * 0.2))
 
-            # --- Current Market Values ---
+            # Current values
             curr_low = float(df['Low'].iloc[-1])
             curr_high = float(df['High'].iloc[-1])
             curr_close = float(df['Close'].iloc[-1])
-            
             support = float(df['Support'].iloc[-1])
             resistance = float(df['Resistance'].iloc[-1])
-            
-            # Create a tiny buffer zone (0.02%) around Support/Resistance to catch touches
-            buffer = curr_close * 0.0002 
-            
+
+            # Buffer threshold to identify zone interaction (0.02%)
+            buffer = curr_close * 0.0002
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
 
-            print(f"Scanning {display_name} | Price: {curr_close:.5f} | PA Engine Active")
+            print(f"Scanning {pair_name} | Price: {curr_close:.5f} | PA Engine Active")
 
-            current_last_signal = last_signals.get(display_name, None)
+            curr_last = last_signals.get(pair_name, None)
 
-            # ==========================================
-            # 🚀 PURE PRICE ACTION SIGNAL LOGIC
-            # ==========================================
-            
-            # CALL SIGNAL (Price is at Support zone)
-            if at_support and current_last_signal != "CALL":
+            # --- 4. Signal Trigger Logic ---
+            # CALL Signals (At Support)
+            if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
-                    send_signal(display_name, "CALL", "1 Min", "Support + Bullish Engulfing")
-                    last_signals[display_name] = "CALL"
+                    send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Engulfing")
+                    last_signals[pair_name] = "CALL"
                 elif bullish_pinbar.iloc[-1]:
-                    send_signal(display_name, "CALL", "1 Min", "Support + Bullish Pin Bar")
-                    last_signals[display_name] = "CALL"
+                    send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Pin Bar")
+                    last_signals[pair_name] = "CALL"
                 elif bullish_pressure.iloc[-1]:
-                    send_signal(display_name, "CALL", "1 Min", "Support + Bullish Pressure")
-                    last_signals[display_name] = "CALL"
-                    
-            # PUT SIGNAL (Price is at Resistance zone)
-            elif at_resistance and current_last_signal != "PUT":
-                if bearish_engulfing.iloc[-1]:
-                    send_signal(display_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
-                    last_signals[display_name] = "PUT"
-                elif bearish_pinbar.iloc[-1]:
-                    send_signal(display_name, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
-                    last_signals[display_name] = "PUT"
-                elif bearish_pressure.iloc[-1]:
-                    send_signal(display_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
-                    last_signals[display_name] = "PUT"
-            
-            # Reset Logic (Ready for next signal when price moves away from S/R)
-            elif not at_support and not at_resistance:
-                last_signals[display_name] = None 
+                    send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Pressure")
+                    last_signals[pair_name] = "CALL"
 
-            time.sleep(2) # Avoid Yahoo Finance IP Ban
+            # PUT Signals (At Resistance)
+            elif at_resistance and curr_last != "PUT":
+                if bearish_engulfing.iloc[-1]:
+                    send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
+                    last_signals[pair_name] = "PUT"
+                elif bearish_pinbar.iloc[-1]:
+                    send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
+                    last_signals[pair_name] = "PUT"
+                elif bearish_pressure.iloc[-1]:
+                    send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
+                    last_signals[pair_name] = "PUT"
+
+            # Reset signal status once price leaves S/R territory
+            elif not at_support and not at_resistance:
+                last_signals[pair_name] = None
+
+            time.sleep(0.3)
 
         except Exception as e:
-            print(f"Error on {display_name}: {e}")
+            print(f"Error scanning {base_pair}: {e}")
+
 
 def run_bot():
-    print("🤖 Pure Price Action Bot Started (S/R + Patterns + Candle Pressure)!")
-    while True:
-        analyze_market()
-        print("--- Waiting 20 seconds to complete the 1-minute cycle ---")
-        time.sleep(20)
+    """Initializes Quotex WebSocket gateway and runs the background loop."""
+    print("[INIT] Connecting to Quotex WebSocket Gateway...")
+    client = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD)
+    connected, reason = client.connect()
 
-# =====================================================================
-# 🚨 GUNICORN FIX: Start the background thread OUTSIDE if __name__ == "__main__"
-# =====================================================================
+    if not connected:
+        print(f"[ERROR] Connection to Quotex failed: {reason}")
+        return
+
+    print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...")
+    while True:
+        try:
+            run_price_action(client)
+            time.sleep(10)  # Interval between scanner sweeps
+        except Exception as err:
+            print(f"[LOOP EXCEPTION] Engine error: {err}")
+            time.sleep(5)
+
+
+# --- Background Worker Thread for Gunicorn / Render compatibility ---
 bot_thread = threading.Thread(target=run_bot)
 bot_thread.daemon = True
 bot_thread.start()
 
+
 @app.route('/')
-def alive():
-    return "Quotex Pure Price Action Bot is alive and running 24/7!"
+def health_check():
+    return "Quotex Pure Price Action Engine is alive and running 24/7!", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
