@@ -29,8 +29,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
 # --- Quotex Account Credentials & Session ---
-QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'your_email@example.com')
-QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'your_password')
+QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', '')
+QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', '')
 QUOTEX_COOKIE = os.environ.get('QUOTEX_COOKIE', '')
 USER_AGENT = os.environ.get(
     'USER_AGENT',
@@ -210,29 +210,39 @@ async def run_price_action(client):
 
 
 async def async_run_bot():
-    """Main asynchronous loop for Quotex WebSocket gateway."""
-    print("[INIT] Connecting to Quotex WebSocket Gateway via Session Cookie...")
+    """Main asynchronous loop bypassing Cloudflare WAF via direct cookies."""
+    print("[INIT] Connecting to Quotex WebSocket Gateway via Direct Session...")
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # Initialize Quotex client without direct cookie argument to avoid TypeError
-    client = Quotex(
-        email=QUOTEX_EMAIL,
-        password=QUOTEX_PASSWORD
-    )
+    # Initialize Quotex client without credentials to avoid hitting login.py scrape
+    client = Quotex()
 
-    # Inject browser session cookies and headers to bypass Cloudflare WAF
+    # Inject headers and authentication cookies directly into the underlying session
     if hasattr(client, 'api'):
         if hasattr(client.api, 'session'):
-            client.api.session.headers.update({"User-Agent": USER_AGENT})
+            client.api.session.headers.update({
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://market-qx.info/"
+            })
             for k, v in parsed_cookies.items():
                 client.api.session.cookies.set(k, v)
+
         if hasattr(client.api, 'custom_cookies'):
             client.api.custom_cookies = QUOTEX_COOKIE
 
-    connected, reason = await client.connect()
+        if 'laravel_session' in parsed_cookies:
+            client.api.token = parsed_cookies['laravel_session']
 
-    if not connected:
+    try:
+        connected, reason = await client.connect()
+    except Exception as e:
+        print(f"[WARN] Direct connect fallback: {e}")
+        connected = False
+        reason = str(e)
+
+    if not connected and not getattr(client, 'check_connect', False):
         print(f"[ERROR] Connection to Quotex failed: {reason}")
         return
 
