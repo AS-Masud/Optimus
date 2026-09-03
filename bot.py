@@ -38,7 +38,7 @@ USER_AGENT = os.environ.get(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
 )
 
-# --- Base Currency Pairs ---
+# --- Active Currency Pairs ---
 forex_pairs = [
     "EURUSD", "GBPJPY", "USDJPY", "AUDJPY", "EURJPY",
     "AUDCAD", "CADJPY", "CHFJPY", "EURAUD", "GBPCAD",
@@ -99,65 +99,56 @@ def send_signal(pair, direction, tf, strategy_name):
         print(f"   -> Telegram Network Exception: {e}", flush=True)
 
 
-async def fetch_pair_candles(client, base_pair, current_time, offset, period):
-    """Subscribes to asset stream before retrieving historical candle data."""
-    formatted_slash = f"{base_pair[:3]}/{base_pair[3:]}"
-    candidate_names = [
-        base_pair,                     # EURUSD
-        f"{base_pair}_otc",            # EURUSD_otc
-        formatted_slash,               # EUR/USD
-        f"{base_pair} (OTC)",          # EURUSD (OTC)
-        f"{formatted_slash} (OTC)"     # EUR/USD (OTC)
-    ]
+async def get_candles_fast(client, asset, period=60):
+    """Fetches candle data with a strict 3-second timeout to avoid loop stalls."""
+    current_time = int(time.time())
+    offset = 3600  # 1 hour lookback (60 candles)
 
-    for name in candidate_names:
+    # Directly check normal pair or OTC pair only
+    for target_symbol in [asset, f"{asset}_otc"]:
         try:
-            # Subscribe to the asset's live WebSocket feed
-            if hasattr(client, 'open_asset'):
-                try:
-                    await client.open_asset(name)
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    pass
+            # 3 second strict timeout per asset
+            res = await asyncio.wait_for(
+                client.get_candles(target_symbol, current_time, offset, period),
+                timeout=3.5
+            )
 
-            res = await client.get_candles(name, current_time, offset, period)
-            if res:
-                if isinstance(res, dict) and 'data' in res:
-                    candles = res['data']
-                elif isinstance(res, dict) and 'candles' in res:
-                    candles = res['candles']
-                else:
-                    candles = res
+            candles = None
+            if isinstance(res, list) and len(res) > 0:
+                candles = res
+            elif isinstance(res, dict):
+                candles = res.get('data') or res.get('candles')
 
-                if candles and isinstance(candles, list) and len(candles) >= 10:
-                    return name, candles
-        except Exception:
+            # Fallback to internal library store if response is cached
+            if not candles and hasattr(client, 'api') and hasattr(client.api, 'candles'):
+                cache = getattr(client.api.candles, 'candles_data', {})
+                if target_symbol in cache:
+                    candles = list(cache[target_symbol].values())
+
+            if candles and len(candles) >= 15:
+                return target_symbol, candles
+
+        except (asyncio.TimeoutError, Exception):
             continue
 
     return None, None
 
 
 async def run_price_action(client):
-    """Asynchronously fetches Quotex candles and executes Price Action scans."""
+    """Asynchronously evaluates market data using technical Price Action rules."""
     global last_signals
-
-    current_time = int(time.time())
-    offset = 3600  # 1 hour lookback
-    period = 60    # 1-minute candles
 
     for base_pair in forex_pairs:
         try:
-            matched_name, candles = await fetch_pair_candles(
-                client, base_pair, current_time, offset, period
-            )
+            matched_symbol, candles = await get_candles_fast(client, base_pair, period=60)
 
             if not candles or len(candles) < 15:
-                print(f"Waiting for live feed: {base_pair}", flush=True)
+                print(f"[SKIP] {base_pair}: No active candle stream available", flush=True)
                 continue
 
             df = pd.DataFrame(candles)
 
-            # Standardize column naming
+            # Normalize columns
             col_map = {}
             for col in df.columns:
                 c_low = str(col).lower()
@@ -175,8 +166,8 @@ async def run_price_action(client):
                 continue
 
             # --- 1. Dynamic Support & Resistance ---
-            df['Support'] = df['Low'].shift(1).rolling(window=20).min()
-            df['Resistance'] = df['High'].shift(1).rolling(window=20).max()
+            df['Support'] = df['Low'].shift(1).rolling(window=15).min()
+            df['Resistance'] = df['High'].shift(1).rolling(window=15).max()
 
             # --- 2. Candlestick Properties ---
             df['Prev_Open'] = df['Open'].shift(1)
@@ -219,40 +210,40 @@ async def run_price_action(client):
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
 
-            print(f"Scanning {matched_name} | Price: {curr_close:.5f} | PA Engine Active", flush=True)
+            print(f"[ACTIVE] {matched_symbol} | Close: {curr_close:.5f} | Supp: {support:.5f} | Res: {resistance:.5f}", flush=True)
 
-            curr_last = last_signals.get(matched_name, None)
+            curr_last = last_signals.get(matched_symbol, None)
 
             # --- 4. Signal Trigger Logic ---
             if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
-                    send_signal(matched_name, "CALL", "1 Min", "Support + Bullish Engulfing")
-                    last_signals[matched_name] = "CALL"
+                    send_signal(matched_symbol, "CALL", "1 Min", "Support + Bullish Engulfing")
+                    last_signals[matched_symbol] = "CALL"
                 elif bullish_pinbar.iloc[-1]:
-                    send_signal(matched_name, "CALL", "1 Min", "Support + Bullish Pin Bar")
-                    last_signals[matched_name] = "CALL"
+                    send_signal(matched_symbol, "CALL", "1 Min", "Support + Bullish Pin Bar")
+                    last_signals[matched_symbol] = "CALL"
                 elif bullish_pressure.iloc[-1]:
-                    send_signal(matched_name, "CALL", "1 Min", "Support + Bullish Pressure")
-                    last_signals[matched_name] = "CALL"
+                    send_signal(matched_symbol, "CALL", "1 Min", "Support + Bullish Pressure")
+                    last_signals[matched_symbol] = "CALL"
 
             elif at_resistance and curr_last != "PUT":
                 if bearish_engulfing.iloc[-1]:
-                    send_signal(matched_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
-                    last_signals[matched_name] = "PUT"
+                    send_signal(matched_symbol, "PUT", "1 Min", "Resistance + Bearish Engulfing")
+                    last_signals[matched_symbol] = "PUT"
                 elif bearish_pinbar.iloc[-1]:
-                    send_signal(matched_name, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
-                    last_signals[matched_name] = "PUT"
+                    send_signal(matched_symbol, "PUT", "1 Min", "Resistance + Bearish Pin Bar")
+                    last_signals[matched_symbol] = "PUT"
                 elif bearish_pressure.iloc[-1]:
-                    send_signal(matched_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
-                    last_signals[matched_name] = "PUT"
+                    send_signal(matched_symbol, "PUT", "1 Min", "Resistance + Bearish Pressure")
+                    last_signals[matched_symbol] = "PUT"
 
             elif not at_support and not at_resistance:
-                last_signals[matched_name] = None
+                last_signals[matched_symbol] = None
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
 
         except Exception as e:
-            print(f"Error scanning {base_pair}: {e}", flush=True)
+            print(f"[ERROR] Pair scan exception on {base_pair}: {e}", flush=True)
 
 
 async def async_run_bot():
@@ -261,7 +252,6 @@ async def async_run_bot():
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # Monkey-patch authenticate to skip Cloudflare-guarded login scraping
     async def bypassed_authenticate(self):
         if hasattr(self, 'session') and self.session:
             self.session.headers.update({
@@ -291,22 +281,22 @@ async def async_run_bot():
         print(f"[ERROR] Connection to Quotex failed: {reason}", flush=True)
         return
 
-    # Select DEMO account mode to open feed channel
+    # Practice mode
     try:
         if hasattr(client, 'change_account'):
-            await client.change_account("DEMO")
-    except Exception as e:
-        print(f"[ACCOUNT] Note on account mode switch: {e}", flush=True)
+            await client.change_account("PRACTICE")
+    except Exception:
+        pass
 
     print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...", flush=True)
     while True:
         try:
-            print("[SCAN CYCLE] Starting asset evaluation pass...", flush=True)
+            print("[SCAN CYCLE] Evaluating currency pairs...", flush=True)
             await run_price_action(client)
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
         except Exception as err:
             print(f"[LOOP EXCEPTION] Engine error: {err}", flush=True)
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
 
 def start_bot_thread():
