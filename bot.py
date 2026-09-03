@@ -5,7 +5,7 @@ import pandas as pd
 import requests
 import pusher
 from flask import Flask
-from pyquotex import Quotex
+from pyquotex.stable_api import Quotex
 
 # --- Flask Server Setup (Keeps Render Web Service alive 24/7) ---
 app = Flask(__name__)
