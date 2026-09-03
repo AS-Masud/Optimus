@@ -103,16 +103,20 @@ async def run_price_action(client):
     """Asynchronously fetches Quotex candles and executes Price Action scans."""
     global last_signals
 
+    current_time = int(time.time())
+    offset = 3600  # Fetch 1 hour (60 candles) of data
+    period = 60    # 1-minute candles
+
     for base_pair in forex_pairs:
         try:
             pair_name = base_pair
-            # 60s timeframe, 30 periods
-            candles = await client.get_candles(pair_name, 60, 30)
+            # Full 4-argument call: asset, end_from_time, offset, period
+            candles = await client.get_candles(pair_name, current_time, offset, period)
 
-            # Fall back to OTC if regular asset data is not available
+            # Fall back to OTC if standard pair market is closed
             if not candles:
                 pair_name = f"{base_pair}_otc"
-                candles = await client.get_candles(pair_name, 60, 30)
+                candles = await client.get_candles(pair_name, current_time, offset, period)
 
             if not candles or len(candles) < 25:
                 continue
@@ -210,7 +214,7 @@ async def async_run_bot():
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # 1. Direct monkey-patch on QuotexAPI class to prevent executing login.py
+    # Direct monkey-patch on QuotexAPI class to prevent executing login.py
     async def bypassed_authenticate(self):
         if hasattr(self, 'session') and self.session:
             self.session.headers.update({
@@ -229,13 +233,11 @@ async def async_run_bot():
     if hasattr(quotex_api_module, 'QuotexAPI'):
         quotex_api_module.QuotexAPI.authenticate = bypassed_authenticate
 
-    # 2. Instantiate client
     client = Quotex(
         email=QUOTEX_EMAIL or "user@example.com",
         password=QUOTEX_PASSWORD or "dummy_pass"
     )
 
-    # 3. Connect to WebSocket
     connected, reason = await client.connect()
 
     if not connected and not getattr(client, 'check_connect', False):
