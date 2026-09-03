@@ -1,180 +1,201 @@
-import os
-import threading
-import time
-import traceback
-from flask import Flask
-import numpy as np
 import pandas as pd
 import pusher
-import requests
+import time
+import os
+import threading
+from flask import Flask
 import yfinance as yf
+import requests
 
 # Flask Web Server Setup (Required for Render uptime)
 app = Flask(__name__)
 
-# --- 1. Pusher Setup (For Netlify Dashboard) ---
-pusher_client = pusher.Pusher(
-    app_id='2190746',
-    key='f6d226d63552173e92b9',
-    secret='0ab61f388d482d06c232',
-    cluster='ap2',
-    ssl=True,
-)
+# --- 1. API Keys & Setup ---
+PUSHER_APP_ID = '2190746'
+PUSHER_KEY = 'f6d226d63552173e92b9'
+PUSHER_SECRET = '0ab61f388d482d06c232'
 
-# --- 2. Telegram Setup (For Optimus Trade Channel) ---
-TELEGRAM_BOT_TOKEN = '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4'
+# 🚨 Place your newly generated Telegram token here
+TELEGRAM_BOT_TOKEN = '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4' 
 TELEGRAM_CHAT_ID = '-1004489990906'
 
-# --- 3. Multi-Currency Quotex Forex List (15 Pairs) ---
+# --- 2. Pusher Client ---
+pusher_client = pusher.Pusher(
+    app_id=PUSHER_APP_ID,
+    key=PUSHER_KEY,
+    secret=PUSHER_SECRET,
+    cluster='ap2',
+    ssl=True
+)
+
+# --- 3. Multi-Currency Quotex Forex List (20 Pairs) ---
 forex_pairs = {
     'EURUSD=X': 'EUR/USD',
-    'GBPUSD=X': 'GBP/USD',
-    'USDJPY=X': 'USD/JPY',
-    'AUDUSD=X': 'AUD/USD',
-    'USDCAD=X': 'USD/CAD',
-    'NZDUSD=X': 'NZD/USD',
-    'USDCHF=X': 'USD/CHF',
-    'EURJPY=X': 'EUR/JPY',
     'GBPJPY=X': 'GBP/JPY',
-    'EURGBP=X': 'EUR/GBP',
+    'USDJPY=X': 'USD/JPY',
     'AUDJPY=X': 'AUD/JPY',
+    'EURJPY=X': 'EUR/JPY',
+    'AUDCAD=X': 'AUD/CAD',
     'CADJPY=X': 'CAD/JPY',
     'CHFJPY=X': 'CHF/JPY',
     'EURAUD=X': 'EUR/AUD',
+    'GBPCAD=X': 'GBP/CAD',
+    'AUDCHF=X': 'AUD/CHF',
+    'EURCAD=X': 'EUR/CAD',
+    'EURCHF=X': 'EUR/CHF',
+    'GBPUSD=X': 'GBP/USD',
+    'USDCAD=X': 'USD/CAD',
+    'AUDUSD=X': 'AUD/USD',
     'GBPAUD=X': 'GBP/AUD',
+    'EURGBP=X': 'EUR/GBP',
+    'GBPCHF=X': 'GBP/CHF',
+    'USDCHF=X': 'USD/CHF'
 }
 
-timeframe = '1m'
-last_signals = {}  # Track last signal per currency pair to avoid spamming
+last_signals = {}
 
-
-def send_signal(pair, direction, tf):
-  print(f'✅ Quotex Signal Sent: {pair} -> {direction} ({tf})')
-
-  # 1. Trigger Pusher for Netlify Dashboard
-  try:
-    pusher_client.trigger(
-        'trading-signals',
-        'new-signal',
-        {'pair': pair, 'direction': direction, 'timeframe': tf},
-    )
-  except Exception as e:
-    print(f'⚠️ Pusher error: {e}')
-
-  # 2. Send Telegram notification with an explicit network timeout
-  try:
-    message = (
-        f'🚨 Quotex Trading Signal!\n\nCurrency: {pair}\nDirection:'
-        f' {direction} (CALL/PUT)\nTimeframe: {tf}'
-    )
-    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
-    requests.post(url, json=payload, timeout=8)
-  except Exception as e:
-    print(f'⚠️ Telegram error: {e}')
-
+def send_signal(pair, direction, tf, strategy_name):
+    print(f"\n✅ SIGNAL DETECTED: {pair} -> {direction} ({strategy_name})")
+    
+    try:
+        pusher_client.trigger('trading-signals', 'new-signal', {
+            'pair': pair,
+            'direction': direction,
+            'timeframe': tf,
+            'strategy': strategy_name
+        })
+    except Exception as e:
+        print(f"   -> ❌ Pusher error: {e}")
+    
+    try:
+        message = f"🚨 *Quotex Trading Signal!*\n\n💱 Currency: {pair}\n📈 Direction: *{direction}* (CALL/PUT)\n⏱ Timeframe: {tf}\n🧠 Strategy: {strategy_name}"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'Markdown'
+        }
+        
+        response = requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code != 200:
+            print(f"   -> ❌ Telegram Failed! Code: {response.status_code}, Reason: {response.text}")
+        else:
+            print("   -> ✅ Telegram message sent successfully!")
+            
+    except Exception as e:
+        print(f"   -> ❌ Telegram Network Error: {e}")
 
 def analyze_market():
-  global last_signals
+    global last_signals
+    
+    for yahoo_symbol, display_name in forex_pairs.items():
+        try:
+            df = yf.download(yahoo_symbol, period='1d', interval='1m', progress=False)
+            
+            if df.empty or len(df) < 30:
+                continue
 
-  for yahoo_symbol, display_name in forex_pairs.items():
-    try:
-      # Explicit timeout prevents yfinance from hanging
-      df = yf.download(
-          yahoo_symbol, period='1d', interval='1m', progress=False, timeout=10
-      )
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
-      if df is None or df.empty or len(df) < 25:
-        continue
+            # --- 1. Bollinger Bands (20, 2) ---
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+            df['STD20'] = df['Close'].rolling(window=20).std()
+            df['Lower_BB'] = df['MA20'] - (df['STD20'] * 2)
+            df['Upper_BB'] = df['MA20'] + (df['STD20'] * 2)
 
-      # Flatten MultiIndex columns if generated by recent yfinance versions
-      if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+            # --- 2. MACD (12, 26, 9) ---
+            exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+            df['MACD'] = exp1 - exp2
+            df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
-      # Ensure Close series is 1-dimensional
-      close_series = df['Close']
-      if isinstance(close_series, pd.DataFrame):
-        close_series = close_series.iloc[:, 0]
+            # --- 3. Price Action (Engulfing & Pin Bar) ---
+            df['Prev_Open'] = df['Open'].shift(1)
+            df['Prev_Close'] = df['Close'].shift(1)
+            
+            # Bullish Engulfing
+            bullish_engulfing = (df['Prev_Close'] < df['Prev_Open']) & (df['Close'] > df['Open']) & (df['Close'] > df['Prev_Open']) & (df['Open'] < df['Prev_Close'])
+            # Bearish Engulfing
+            bearish_engulfing = (df['Prev_Close'] > df['Prev_Open']) & (df['Close'] < df['Open']) & (df['Close'] < df['Prev_Open']) & (df['Open'] > df['Prev_Close'])
+            
+            # Pin Bar (Hammer / Shooting Star)
+            body = abs(df['Close'] - df['Open'])
+            lower_wick = df[['Open', 'Close']].min(axis=1) - df['Low']
+            upper_wick = df['High'] - df[['Open', 'Close']].max(axis=1)
+            
+            bullish_pinbar = (lower_wick > (2 * body)) & (upper_wick < body)
+            bearish_pinbar = (upper_wick > (2 * body)) & (lower_wick < body)
 
-      # Technical Calculations (RSI 14 & Bollinger Bands 20, 2)
-      delta = close_series.diff()
-      gain = (delta.where(delta > 0, 0.0)).rolling(window=14).mean()
-      loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+            # --- Latest Values ---
+            curr_low = float(df['Low'].iloc[-1])
+            curr_high = float(df['High'].iloc[-1])
+            lower_bb = float(df['Lower_BB'].iloc[-1])
+            upper_bb = float(df['Upper_BB'].iloc[-1])
+            
+            # MACD Crossover check
+            macd_cross_up = (df['MACD'].iloc[-1] > df['Signal_Line'].iloc[-1]) and (df['MACD'].iloc[-2] <= df['Signal_Line'].iloc[-2])
+            macd_cross_down = (df['MACD'].iloc[-1] < df['Signal_Line'].iloc[-1]) and (df['MACD'].iloc[-2] >= df['Signal_Line'].iloc[-2])
 
-      # Prevent division by zero errors
-      rs = gain / loss.replace(0, np.nan)
-      rsi_series = 100 - (100 / (1 + rs))
-      rsi_series = rsi_series.fillna(50.0)
+            # Price Action Check
+            pa_bullish = bullish_engulfing.iloc[-1] or bullish_pinbar.iloc[-1]
+            pa_bearish = bearish_engulfing.iloc[-1] or bearish_pinbar.iloc[-1]
 
-      ma20 = close_series.rolling(window=20).mean()
-      std20 = close_series.rolling(window=20).std()
-      lower_bb = ma20 - (std20 * 2)
-      upper_bb = ma20 + (std20 * 2)
+            print(f"Scanning {display_name} | Price: {float(df['Close'].iloc[-1]):.5f} | Hybrid Engine Active")
 
-      current_price = float(close_series.iloc[-1])
-      current_rsi = float(rsi_series.iloc[-1])
-      lower_band = float(lower_bb.iloc[-1])
-      upper_band = float(upper_bb.iloc[-1])
+            current_last_signal = last_signals.get(display_name, None)
 
-      print(
-          f'Scanning {display_name} | Price: {current_price:.5f} | RSI:'
-          f' {current_rsi:.2f}'
-      )
+            # ==========================================
+            # 🚀 THE HYBRID SIGNAL LOGIC (OR CONDITION)
+            # ==========================================
+            
+            # CALL SIGNAL (If price drops to lower band)
+            if curr_low <= lower_bb and current_last_signal != "CALL":
+                if macd_cross_up:
+                    send_signal(display_name, "CALL", "1 Min", "MACD Reversal")
+                    last_signals[display_name] = "CALL"
+                elif pa_bullish:
+                    send_signal(display_name, "CALL", "1 Min", "Price Action (Bullish)")
+                    last_signals[display_name] = "CALL"
+                    
+            # PUT SIGNAL (If price rises to upper band)
+            elif curr_high >= upper_bb and current_last_signal != "PUT":
+                if macd_cross_down:
+                    send_signal(display_name, "PUT", "1 Min", "MACD Reversal")
+                    last_signals[display_name] = "PUT"
+                elif pa_bearish:
+                    send_signal(display_name, "PUT", "1 Min", "Price Action (Bearish)")
+                    last_signals[display_name] = "PUT"
+            
+            # Reset Logic (Ready for a new signal once price enters inside the bands)
+            elif lower_bb < float(df['Close'].iloc[-1]) < upper_bb:
+                last_signals[display_name] = None 
 
-      current_last_signal = last_signals.get(display_name, None)
+            time.sleep(2) # Avoid IP ban
 
-      if (
-          current_rsi < 30
-          and current_price <= lower_band
-          and current_last_signal != 'CALL'
-      ):
-        send_signal(display_name, 'CALL', '1 Min')
-        last_signals[display_name] = 'CALL'
-
-      elif (
-          current_rsi > 70
-          and current_price >= upper_band
-          and current_last_signal != 'PUT'
-      ):
-        send_signal(display_name, 'PUT', '1 Min')
-        last_signals[display_name] = 'PUT'
-
-      elif 40 < current_rsi < 60:
-        last_signals[display_name] = None
-
-    except Exception as e:
-      print(f'⚠️ Error on {display_name}: {e}')
-
-    # 3-second delay between individual pairs to avoid HTTP 429 rate-limiting
-    time.sleep(3)
-
+        except Exception as e:
+            print(f"Error on {display_name}: {e}")
 
 def run_bot():
-  print('🤖 Multi-Currency Quotex Bot Started with Telegram & Pusher!')
-  time.sleep(3)
+    print("🤖 Ultimate Hybrid Quotex Bot Started (BB + MACD + Price Action, 20 Pairs)!")
+    while True:
+        analyze_market()
+        print("--- Waiting 60 seconds for next 1-minute candle ---")
+        time.sleep(60)
 
-  # Resilient worker loop that auto-recovers on any unhandled crash
-  while True:
-    try:
-      analyze_market()
-    except Exception as fatal_err:
-      print(f'🚨 Critical error caught in scanner loop: {fatal_err}')
-      traceback.print_exc()
-      time.sleep(10)
-
-    # 60-second cooldown between full market scans
-    time.sleep(60)
-
+# =====================================================================
+# 🚨 GUNICORN FIX: Start the background thread OUTSIDE if __name__ == "__main__"
+# =====================================================================
+bot_thread = threading.Thread(target=run_bot)
+bot_thread.daemon = True
+bot_thread.start()
 
 @app.route('/')
 def alive():
-  return 'Quotex Multi-Currency Bot with Telegram is alive and running 24/7!'
+    return "Quotex Ultimate Hybrid Bot is alive and running 24/7!"
 
-
-# Start worker thread
-bot_thread = threading.Thread(target=run_bot, daemon=True)
-bot_thread.start()
-
-if __name__ == '__main__':
-  port = int(os.environ.get('PORT', 5000))
-  app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
