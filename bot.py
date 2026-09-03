@@ -62,7 +62,7 @@ def parse_cookies(cookie_str):
 
 def send_signal(pair, direction, tf, strategy_name):
     """Dispatches trading signals to Pusher Dashboard and Telegram Channel."""
-    print(f"\n[SIGNAL] {pair} -> {direction} ({strategy_name})")
+    print(f"\n[SIGNAL] {pair} -> {direction} ({strategy_name})", flush=True)
 
     # 1. Pusher Dashboard Trigger
     try:
@@ -73,7 +73,7 @@ def send_signal(pair, direction, tf, strategy_name):
             'strategy': strategy_name
         })
     except Exception as e:
-        print(f"   -> Pusher Error: {e}")
+        print(f"   -> Pusher Error: {e}", flush=True)
 
     # 2. Telegram Message Alert
     try:
@@ -92,11 +92,11 @@ def send_signal(pair, direction, tf, strategy_name):
         }
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code != 200:
-            print(f"   -> Telegram API Failed: {response.status_code} - {response.text}")
+            print(f"   -> Telegram API Failed: {response.status_code} - {response.text}", flush=True)
         else:
-            print("   -> Telegram alert sent successfully.")
+            print("   -> Telegram alert sent successfully.", flush=True)
     except Exception as e:
-        print(f"   -> Telegram Network Exception: {e}")
+        print(f"   -> Telegram Network Exception: {e}", flush=True)
 
 
 async def run_price_action(client):
@@ -104,21 +104,25 @@ async def run_price_action(client):
     global last_signals
 
     current_time = int(time.time())
-    offset = 3600  # Fetch 1 hour (60 candles) of data
+    offset = 3600  # 1 hour lookback
     period = 60    # 1-minute candles
 
     for base_pair in forex_pairs:
         try:
             pair_name = base_pair
-            # Full 4-argument call: asset, end_from_time, offset, period
             candles = await client.get_candles(pair_name, current_time, offset, period)
 
-            # Fall back to OTC if standard pair market is closed
+            # Fall back to OTC if standard pair returns no candle data
             if not candles:
                 pair_name = f"{base_pair}_otc"
                 candles = await client.get_candles(pair_name, current_time, offset, period)
 
-            if not candles or len(candles) < 25:
+            if not candles:
+                print(f"No candles returned for {base_pair} / {pair_name}", flush=True)
+                continue
+
+            if len(candles) < 25:
+                print(f"Insufficient candles for {pair_name}: count={len(candles)}", flush=True)
                 continue
 
             df = pd.DataFrame(candles)
@@ -172,7 +176,7 @@ async def run_price_action(client):
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
 
-            print(f"Scanning {pair_name} | Price: {curr_close:.5f} | PA Engine Active")
+            print(f"Scanning {pair_name} | Price: {curr_close:.5f} | Engine Active", flush=True)
 
             curr_last = last_signals.get(pair_name, None)
 
@@ -205,16 +209,15 @@ async def run_price_action(client):
             await asyncio.sleep(0.3)
 
         except Exception as e:
-            print(f"Error scanning {base_pair}: {e}")
+            print(f"Error scanning {base_pair}: {e}", flush=True)
 
 
 async def async_run_bot():
     """Bypasses Cloudflare login scrapers using module-level method overrides."""
-    print("[INIT] Connecting to Quotex WebSocket Gateway via Session...")
+    print("[INIT] Connecting to Quotex WebSocket Gateway via Session...", flush=True)
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # Direct monkey-patch on QuotexAPI class to prevent executing login.py
     async def bypassed_authenticate(self):
         if hasattr(self, 'session') and self.session:
             self.session.headers.update({
@@ -241,16 +244,17 @@ async def async_run_bot():
     connected, reason = await client.connect()
 
     if not connected and not getattr(client, 'check_connect', False):
-        print(f"[ERROR] Connection to Quotex failed: {reason}")
+        print(f"[ERROR] Connection to Quotex failed: {reason}", flush=True)
         return
 
-    print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...")
+    print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...", flush=True)
     while True:
         try:
+            print("[SCAN CYCLE] Starting asset evaluation pass...", flush=True)
             await run_price_action(client)
             await asyncio.sleep(10)
         except Exception as err:
-            print(f"[LOOP EXCEPTION] Engine error: {err}")
+            print(f"[LOOP EXCEPTION] Engine error: {err}", flush=True)
             await asyncio.sleep(5)
 
 
