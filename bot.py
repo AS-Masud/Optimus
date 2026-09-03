@@ -33,7 +33,7 @@ QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'your_email@example.com')
 QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'your_password')
 QUOTEX_COOKIE = os.environ.get('QUOTEX_COOKIE', '')
 USER_AGENT = os.environ.get(
-    'USER_AGENT', 
+    'USER_AGENT',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
 )
 
@@ -48,7 +48,7 @@ last_signals = {}
 
 
 def parse_cookies(cookie_str):
-    """Converts a raw cookie string into a clean dictionary for pyquotex."""
+    """Converts a raw cookie string into a clean dictionary."""
     cookie_dict = {}
     if cookie_str:
         for item in cookie_str.split(';'):
@@ -212,15 +212,23 @@ async def run_price_action(client):
 async def async_run_bot():
     """Main asynchronous loop for Quotex WebSocket gateway."""
     print("[INIT] Connecting to Quotex WebSocket Gateway via Session Cookie...")
-    
+
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
+    # Initialize Quotex client without direct cookie argument to avoid TypeError
     client = Quotex(
         email=QUOTEX_EMAIL,
-        password=QUOTEX_PASSWORD,
-        cookies=parsed_cookies,
-        user_agent=USER_AGENT
+        password=QUOTEX_PASSWORD
     )
+
+    # Inject browser session cookies and headers to bypass Cloudflare WAF
+    if hasattr(client, 'api'):
+        if hasattr(client.api, 'session'):
+            client.api.session.headers.update({"User-Agent": USER_AGENT})
+            for k, v in parsed_cookies.items():
+                client.api.session.cookies.set(k, v)
+        if hasattr(client.api, 'custom_cookies'):
+            client.api.custom_cookies = QUOTEX_COOKIE
 
     connected, reason = await client.connect()
 
