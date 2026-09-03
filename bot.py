@@ -103,11 +103,11 @@ def analyze_market():
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            # --- 1. Bollinger Bands (20, 2) ---
+            # --- 1. Bollinger Bands (20, 1.5) - RELAXED FOR MORE SIGNALS ---
             df['MA20'] = df['Close'].rolling(window=20).mean()
             df['STD20'] = df['Close'].rolling(window=20).std()
-            df['Lower_BB'] = df['MA20'] - (df['STD20'] * 2)
-            df['Upper_BB'] = df['MA20'] + (df['STD20'] * 2)
+            df['Lower_BB'] = df['MA20'] - (df['STD20'] * 1.5) # Changed from 2 to 1.5
+            df['Upper_BB'] = df['MA20'] + (df['STD20'] * 1.5) # Changed from 2 to 1.5
 
             # --- 2. MACD (12, 26, 9) ---
             exp1 = df['Close'].ewm(span=12, adjust=False).mean()
@@ -182,7 +182,7 @@ def analyze_market():
             print(f"Error on {display_name}: {e}")
 
 def run_bot():
-    print("🤖 Ultimate Hybrid Quotex Bot Started (BB + MACD + Price Action, 20 Pairs)!")
+    print("🤖 Ultimate Hybrid Quotex Bot Started (BB 1.5 + MACD + PA, 20 Pairs)!")
     while True:
         analyze_market()
         print("--- Waiting 20 seconds to complete the 1-minute cycle ---")
