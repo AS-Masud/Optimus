@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import threading
 import pandas as pd
 import requests
@@ -31,7 +32,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 QUOTEX_EMAIL = os.environ.get('QUOTEX_EMAIL', 'your_email@example.com')
 QUOTEX_PASSWORD = os.environ.get('QUOTEX_PASSWORD', 'your_password')
 
-# --- Assets List (Scans Live during regular hours, switches to OTC automatically) ---
+# --- Assets List ---
 forex_pairs = [
     "EURUSD", "GBPJPY", "USDJPY", "AUDJPY", "EURJPY",
     "AUDCAD", "CADJPY", "CHFJPY", "EURAUD", "GBPCAD",
@@ -45,7 +46,7 @@ def send_signal(pair, direction, tf, strategy_name):
     """Dispatches trading signals to Pusher Dashboard and Telegram Channel."""
     print(f"\n[SIGNAL] {pair} -> {direction} ({strategy_name})")
 
-    # 1. Send signal to Web Dashboard (Pusher)
+    # 1. Pusher Dashboard Event
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
             'pair': pair,
@@ -56,7 +57,7 @@ def send_signal(pair, direction, tf, strategy_name):
     except Exception as e:
         print(f"   -> Pusher Error: {e}")
 
-    # 2. Send signal to Telegram Channel
+    # 2. Telegram Alert
     try:
         message = (
             f"🚨 *Quotex Pure Price Action Signal!*\n\n"
@@ -77,31 +78,29 @@ def send_signal(pair, direction, tf, strategy_name):
         else:
             print("   -> Telegram alert delivered successfully.")
     except Exception as e:
-        print(f"   -> Telegram Request Exception: {e}")
+        print(f"   -> Telegram Network Exception: {e}")
 
 
-def run_price_action(client):
-    """Fetches real-time Quotex candle data and executes the Price Action engine."""
+async def run_price_action(client):
+    """Fetches real-time candles asynchronously and executes Price Action scans."""
     global last_signals
 
     for base_pair in forex_pairs:
         try:
-            # First attempt: standard regular market asset
             pair_name = base_pair
-            candles = client.get_candles(pair_name, 60, 30)  # 30 candles on 60s timeframe
+            # Await candle data asynchronously (1-minute candles, 30 periods)
+            candles = await client.get_candles(pair_name, 60, 30)
 
-            # Fallback: if regular asset has no feed (e.g. weekend/after-hours), query the OTC asset
+            # Fallback to OTC if regular pair market is closed
             if not candles:
                 pair_name = f"{base_pair}_otc"
-                candles = client.get_candles(pair_name, 60, 30)
+                candles = await client.get_candles(pair_name, 60, 30)
 
             if not candles or len(candles) < 25:
                 continue
 
-            # Convert fetched candles to a Pandas DataFrame
+            # Convert to DataFrame and standardize column names
             df = pd.DataFrame(candles)
-
-            # Standardize OHLC column headers across pyquotex versions
             df.rename(
                 columns={'max': 'High', 'min': 'Low', 'open': 'Open', 'close': 'Close'},
                 inplace=True
@@ -111,7 +110,7 @@ def run_price_action(client):
             df['Support'] = df['Low'].shift(1).rolling(window=20).min()
             df['Resistance'] = df['High'].shift(1).rolling(window=20).max()
 
-            # --- 2. Candlestick Dimensional Properties ---
+            # --- 2. Candlestick Properties ---
             df['Prev_Open'] = df['Open'].shift(1)
             df['Prev_Close'] = df['Close'].shift(1)
 
@@ -142,14 +141,13 @@ def run_price_action(client):
             bullish_pressure = (df['Close'] > df['Open']) & (body > (total_range * 0.5)) & (upper_wick < (body * 0.2))
             bearish_pressure = (df['Open'] > df['Close']) & (body > (total_range * 0.5)) & (lower_wick < (body * 0.2))
 
-            # Current values
             curr_low = float(df['Low'].iloc[-1])
             curr_high = float(df['High'].iloc[-1])
             curr_close = float(df['Close'].iloc[-1])
             support = float(df['Support'].iloc[-1])
             resistance = float(df['Resistance'].iloc[-1])
 
-            # Buffer threshold to identify zone interaction (0.02%)
+            # Buffer zone (0.02%)
             buffer = curr_close * 0.0002
             at_support = curr_low <= (support + buffer)
             at_resistance = curr_high >= (resistance - buffer)
@@ -159,7 +157,7 @@ def run_price_action(client):
             curr_last = last_signals.get(pair_name, None)
 
             # --- 4. Signal Trigger Logic ---
-            # CALL Signals (At Support)
+            # CALL Signals (Support Zone)
             if at_support and curr_last != "CALL":
                 if bullish_engulfing.iloc[-1]:
                     send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Engulfing")
@@ -171,7 +169,7 @@ def run_price_action(client):
                     send_signal(pair_name, "CALL", "1 Min", "Support + Bullish Pressure")
                     last_signals[pair_name] = "CALL"
 
-            # PUT Signals (At Resistance)
+            # PUT Signals (Resistance Zone)
             elif at_resistance and curr_last != "PUT":
                 if bearish_engulfing.iloc[-1]:
                     send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Engulfing")
@@ -183,21 +181,22 @@ def run_price_action(client):
                     send_signal(pair_name, "PUT", "1 Min", "Resistance + Bearish Pressure")
                     last_signals[pair_name] = "PUT"
 
-            # Reset signal status once price leaves S/R territory
+            # Reset signal trigger once price moves away from S/R zone
             elif not at_support and not at_resistance:
                 last_signals[pair_name] = None
 
-            time.sleep(0.3)
+            await asyncio.sleep(0.3)
 
         except Exception as e:
             print(f"Error scanning {base_pair}: {e}")
 
 
-def run_bot():
-    """Initializes Quotex WebSocket gateway and runs the background loop."""
+async def async_run_bot():
+    """Asynchronous entry point that maintains the persistent Quotex connection."""
     print("[INIT] Connecting to Quotex WebSocket Gateway...")
     client = Quotex(email=QUOTEX_EMAIL, password=QUOTEX_PASSWORD)
-    connected, reason = client.connect()
+
+    connected, reason = await client.connect()
 
     if not connected:
         print(f"[ERROR] Connection to Quotex failed: {reason}")
@@ -206,22 +205,27 @@ def run_bot():
     print("[STATUS] Connected successfully to Quotex! Starting Real-time Engine...")
     while True:
         try:
-            run_price_action(client)
-            time.sleep(10)  # Interval between scanner sweeps
+            await run_price_action(client)
+            await asyncio.sleep(10)
         except Exception as err:
             print(f"[LOOP EXCEPTION] Engine error: {err}")
-            time.sleep(5)
+            await asyncio.sleep(5)
 
 
-# --- Background Worker Thread for Gunicorn / Render compatibility ---
-bot_thread = threading.Thread(target=run_bot)
+def start_bot_thread():
+    """Launches the asyncio event loop inside a daemonized background thread."""
+    asyncio.run(async_run_bot())
+
+
+# Launch background worker
+bot_thread = threading.Thread(target=start_bot_thread)
 bot_thread.daemon = True
 bot_thread.start()
 
 
 @app.route('/')
 def health_check():
-    return "Quotex Pure Price Action Engine is alive and running 24/7!", 200
+    return "Quotex Real-Time PA Engine is alive and running 24/7!", 200
 
 
 if __name__ == "__main__":
