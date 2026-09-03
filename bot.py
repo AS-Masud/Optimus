@@ -212,36 +212,35 @@ async def async_run_bot():
 
     parsed_cookies = parse_cookies(QUOTEX_COOKIE)
 
-    # 1. Initialize with email/password parameters to satisfy __init__
+    # 1. Initialize client
     client = Quotex(
         email=QUOTEX_EMAIL or "user@example.com",
         password=QUOTEX_PASSWORD or "dummy_pass"
     )
 
-    # 2. Inject session cookies & headers directly into internal HTTP session
-    if hasattr(client, 'api'):
-        if hasattr(client.api, 'session'):
-            client.api.session.headers.update({
+    # 2. Safely apply headers and session cookies
+    api_instance = getattr(client, 'api', None)
+    if api_instance is not None:
+        session_obj = getattr(api_instance, 'session', None)
+        if session_obj is not None:
+            session_obj.headers.update({
                 "User-Agent": USER_AGENT,
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://market-qx.info/"
             })
             for k, v in parsed_cookies.items():
-                client.api.session.cookies.set(k, v)
+                session_obj.cookies.set(k, v)
 
-        if hasattr(client.api, 'custom_cookies'):
-            client.api.custom_cookies = QUOTEX_COOKIE
+        if hasattr(api_instance, 'custom_cookies'):
+            api_instance.custom_cookies = QUOTEX_COOKIE
 
-        if 'laravel_session' in parsed_cookies:
-            client.api.token = parsed_cookies['laravel_session']
-
-        # 3. Bypass the scraping authenticate() method which causes HTTP 403
+        # Safely override the scraping authenticate method to avoid HTTP 403
         async def bypass_authenticate():
             return True, "Authenticated via Session Cookie"
 
-        client.api.authenticate = bypass_authenticate
+        api_instance.authenticate = bypass_authenticate
 
-    # 4. Connect directly to WebSocket
+    # 3. Direct WebSocket Connect
     connected, reason = await client.connect()
 
     if not connected and not getattr(client, 'check_connect', False):
