@@ -6,10 +6,10 @@ import requests
 import pusher
 from flask import Flask
 
-# --- Flask Web Server ---
+# --- Flask Server Setup ---
 app = Flask(__name__)
 
-# --- Pusher Setup ---
+# --- Pusher Credentials ---
 PUSHER_APP_ID = os.environ.get('PUSHER_APP_ID', '2190746')
 PUSHER_KEY = os.environ.get('PUSHER_KEY', 'f6d226d63552173e92b9')
 PUSHER_SECRET = os.environ.get('PUSHER_SECRET', '0ab61f388d482d06c232')
@@ -22,28 +22,36 @@ pusher_client = pusher.Pusher(
     ssl=True
 )
 
-# --- Telegram Bot Setup ---
+# --- Telegram Credentials ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- TwelveData API Key ---
-TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY', '31c5e6f950c44a41a06b90dc6a57f8a2')
+# --- Finnhub API Key ---
+FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY', 'daaqf5hr01qn50rj81a0daaqf5hr01qn50rj81ag')
 
-# --- Active Pairs ---
-forex_pairs = [
-    "EUR/USD", "GBP/JPY", "USD/JPY", "AUD/JPY", "EUR/JPY",
-    "GBP/USD", "USD/CAD", "AUD/USD", "EUR/GBP"
-]
+# --- 10 Major Forex Pairs (Finnhub OANDA Symbol Format) ---
+forex_pairs = {
+    "EUR/USD": "OANDA:EUR_USD",
+    "GBP/USD": "OANDA:GBP_USD",
+    "USD/JPY": "OANDA:USD_JPY",
+    "AUD/USD": "OANDA:AUD_USD",
+    "USD/CAD": "OANDA:USD_CAD",
+    "EUR/JPY": "OANDA:EUR_JPY",
+    "GBP/JPY": "OANDA:GBP_JPY",
+    "AUD/JPY": "OANDA:AUD_JPY",
+    "EUR/GBP": "OANDA:EUR_GBP",
+    "USD/CHF": "OANDA:USD_CHF"
+}
 
 last_signals = {}
 
 
 def send_signal(pair, direction, tf, strategy_name, price):
-    """Dispatches high-probability trading signals to Pusher and Telegram."""
+    """Sends trading signals to Telegram and Pusher."""
     clean_pair = pair.replace("/", "")
     print(f"\n[HIGH-PROBABILITY SIGNAL] {clean_pair} -> {direction} @ {price:.5f}", flush=True)
 
-    # 1. Pusher Notification
+    # 1. Pusher Event
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
             'pair': clean_pair,
@@ -58,12 +66,12 @@ def send_signal(pair, direction, tf, strategy_name, price):
     # 2. Telegram Alert
     try:
         message = (
-            f"🎯 *High Probability PA Signal!*\n\n"
+            f"🎯 *Finnhub Live PA Signal!*\n\n"
             f"💱 *Pair:* {clean_pair}\n"
             f"📈 *Direction:* {direction} (CALL / PUT)\n"
             f"⏱ *Expiration:* {tf}\n"
-            f"💵 *Entry Price:* {price:.5f}\n"
-            f"🧠 *Setup:* {strategy_name}"
+            f"💵 *Price:* {price:.5f}\n"
+            f"🧠 *Strategy:* {strategy_name}"
         )
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -71,13 +79,13 @@ def send_signal(pair, direction, tf, strategy_name, price):
             'text': message,
             'parse_mode': 'Markdown'
         }
-        requests.post(url, json=payload, timeout=10)
+        requests.post(url, json=payload, timeout=8)
     except Exception as e:
         print(f"Telegram alert error: {e}", flush=True)
 
 
 def calculate_rsi(series, period=14):
-    """Calculates relative strength index."""
+    """Calculates RSI."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -85,31 +93,37 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def scan_pair(pair):
-    """Fetches real-time candles and validates 3-layer confluence."""
+def scan_pair(display_name, symbol):
+    """Fetches Finnhub 1m candles and runs confluence filters."""
     global last_signals
 
+    now = int(time.time())
+    start_time = now - (60 * 60)  # Last 60 minutes
+
     url = (
-        f"https://api.twelvedata.com/time_series?"
-        f"symbol={pair}&interval=1min&outputsize=45&apikey={TWELVE_DATA_API_KEY}"
+        f"https://finnhub.io/api/v1/forex/candle?"
+        f"symbol={symbol}&resolution=1&from={start_time}&to={now}&token={FINNHUB_API_KEY}"
     )
 
     try:
-        response = requests.get(url, timeout=12)
-        res_json = response.json()
+        res = requests.get(url, timeout=8)
+        data = res.json()
 
-        if "values" not in res_json:
+        if data.get('s') != 'ok':
             return
 
-        df = pd.DataFrame(res_json["values"])
-        df = df.iloc[::-1].reset_index(drop=True)
+        df = pd.DataFrame({
+            'open': data['o'],
+            'high': data['h'],
+            'low': data['l'],
+            'close': data['c'],
+            'timestamp': data['t']
+        })
 
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['close'] = df['close'].astype(float)
+        if len(df) < 25:
+            return
 
-        # 1. Dynamic Support & Resistance
+        # 1. Support & Resistance (Last 20 Candles)
         df['Support'] = df['low'].shift(1).rolling(window=20).min()
         df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
 
@@ -119,7 +133,7 @@ def scan_pair(pair):
         # 3. EMA 100 Trend Direction
         df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
 
-        # Candlestick Calculations
+        # Candlestick Shapes
         body = (df['close'] - df['open']).abs()
         total_range = df['high'] - df['low']
         lower_wick = df[['open', 'close']].min(axis=1) - df['low']
@@ -141,38 +155,36 @@ def scan_pair(pair):
         at_support = curr_low <= (support + buffer)
         at_resistance = curr_high >= (resistance - buffer)
 
-        curr_last = last_signals.get(pair, None)
+        curr_last = last_signals.get(display_name, None)
 
-        # --- High-Probability Confluence Filter ---
-
-        # 1. CALL: At Support + Uptrend (Close > EMA100) + RSI Oversold (<35) + Hammer Rejection
+        # --- 3-Layer Confluence Filter ---
+        # CALL Criteria
         if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body and curr_last != "CALL":
             strategy = "Support Bounce + Uptrend + RSI Oversold + Hammer"
-            send_signal(pair, "CALL", "2-3 Min", strategy, curr_close)
-            last_signals[pair] = "CALL"
+            send_signal(display_name, "CALL", "2-3 Min", strategy, curr_close)
+            last_signals[display_name] = "CALL"
 
-        # 2. PUT: At Resistance + Downtrend (Close < EMA100) + RSI Overbought (>65) + Star Rejection
+        # PUT Criteria
         elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body and curr_last != "PUT":
             strategy = "Resistance Rejection + Downtrend + RSI Overbought + Pinbar"
-            send_signal(pair, "PUT", "2-3 Min", strategy, curr_close)
-            last_signals[pair] = "PUT"
+            send_signal(display_name, "PUT", "2-3 Min", strategy, curr_close)
+            last_signals[display_name] = "PUT"
 
         elif not at_support and not at_resistance:
-            last_signals[pair] = None
+            last_signals[display_name] = None
 
-    except requests.exceptions.Timeout:
-        pass
     except Exception as err:
-        print(f"Error parsing {pair}: {err}", flush=True)
+        print(f"Error scanning {display_name}: {err}", flush=True)
 
 
 def background_scanner():
-    """Main continuous scanner loop throttled to avoid TwelveData free tier limits."""
-    print("[ACTIVE] Real-time High Probability PA Bot Running...", flush=True)
+    """Continuously scans 10 forex pairs without hitting limits."""
+    print("[ACTIVE] Finnhub Real-time 24/7 Scanner Running...", flush=True)
     while True:
-        for pair in forex_pairs:
-            scan_pair(pair)
-            time.sleep(8)  # Complies with 8 requests/min limit
+        for display_name, symbol in forex_pairs.items():
+            scan_pair(display_name, symbol)
+            time.sleep(1.2)  # Well within Finnhub's 60 calls/min limit
+        time.sleep(2)
 
 
 # Launch background worker
@@ -183,7 +195,7 @@ scanner_thread.start()
 
 @app.route('/')
 def health():
-    return "Real-Time Trading Bot is Healthy and Active!", 200
+    return "Finnhub Trading Bot is Healthy and Active 24/7!", 200
 
 
 if __name__ == "__main__":
