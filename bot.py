@@ -1,12 +1,14 @@
 import os
 import time
+import json
 import threading
 import pandas as pd
 import requests
 import pusher
+import websocket
 from flask import Flask
 
-# --- Flask Server Setup (Keep Render Alive) ---
+# --- Flask Server Setup (Render Keep-Alive) ---
 app = Flask(__name__)
 
 # --- Pusher Configuration ---
@@ -22,32 +24,30 @@ pusher_client = pusher.Pusher(
     ssl=True
 )
 
-# --- Telegram Bot Configuration ---
+# --- Telegram Bot Setup ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- Finnhub API Key ---
-FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY', 'daaqf5hr01qn50rj81a0daaqf5hr01qn50rj81ag')
-
-# --- 10 Major Forex Pairs (Finnhub OANDA Symbol Format) ---
+# --- Deriv 10 Major Forex Symbols ---
 forex_pairs = {
-    "EUR/USD": "OANDA:EUR_USD",
-    "GBP/USD": "OANDA:GBP_USD",
-    "USD/JPY": "OANDA:USD_JPY",
-    "AUD/USD": "OANDA:AUD_USD",
-    "USD/CAD": "OANDA:USD_CAD",
-    "EUR/JPY": "OANDA:EUR_JPY",
-    "GBP/JPY": "OANDA:GBP_JPY",
-    "AUD/JPY": "OANDA:AUD_JPY",
-    "EUR/GBP": "OANDA:EUR_GBP",
-    "USD/CHF": "OANDA:USD_CHF"
+    "EUR/USD": "frxEURUSD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/JPY": "frxUSDJPY",
+    "AUD/USD": "frxAUDUSD",
+    "USD/CAD": "frxUSDCAD",
+    "EUR/JPY": "frxEURJPY",
+    "GBP/JPY": "frxGBPJPY",
+    "AUD/JPY": "frxAUDJPY",
+    "EUR/GBP": "frxEURGBP",
+    "USD/CHF": "frxUSDCHF"
 }
 
 last_signals = {}
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
 
 def send_signal(pair, direction, tf, strategy_name, price):
-    """Dispatches high-probability trading signals to Pusher and Telegram."""
+    """Sends trading signals to Telegram and Pusher."""
     clean_pair = pair.replace("/", "")
     print(f"\n[HIGH-PROBABILITY SIGNAL] {clean_pair} -> {direction} @ {price:.5f}", flush=True)
 
@@ -66,7 +66,7 @@ def send_signal(pair, direction, tf, strategy_name, price):
     # 2. Telegram Alert
     try:
         message = (
-            f"🎯 *Finnhub Live PA Signal!*\n\n"
+            f"🎯 *Deriv Zero-Delay PA Signal!*\n\n"
             f"💱 *Pair:* {clean_pair}\n"
             f"📈 *Direction:* {direction} (CALL / PUT)\n"
             f"⏱ *Expiration:* {tf}\n"
@@ -81,11 +81,11 @@ def send_signal(pair, direction, tf, strategy_name, price):
         }
         requests.post(url, json=payload, timeout=8)
     except Exception as e:
-        print(f"Telegram alert error: {e}", flush=True)
+        print(f"Telegram error: {e}", flush=True)
 
 
 def calculate_rsi(series, period=14):
-    """Calculates Relative Strength Index."""
+    """Calculates RSI value."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -93,107 +93,104 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def scan_pair(display_name, symbol):
-    """Fetches real-time 1m candles from Finnhub and executes 3-layer confluence checks."""
+def analyze_candles(display_name, candles):
+    """Applies 3-layer confluence strategy on 1m candles."""
     global last_signals
 
-    now = int(time.time())
-    start_time = now - (60 * 60)  # Lookback past 60 minutes
+    if len(candles) < 30:
+        return
 
-    url = (
-        f"https://finnhub.io/api/v1/forex/candle?"
-        f"symbol={symbol}&resolution=1&from={start_time}&to={now}&token={FINNHUB_API_KEY}"
-    )
+    df = pd.DataFrame(candles)
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
 
+    # 1. Dynamic Support & Resistance
+    df['Support'] = df['low'].shift(1).rolling(window=20).min()
+    df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
+
+    # 2. Indicators
+    df['RSI'] = calculate_rsi(df['close'], 14)
+    df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
+
+    # Candlestick Anatomy
+    body = (df['close'] - df['open']).abs()
+    total_range = df['high'] - df['low']
+    lower_wick = df[['open', 'close']].min(axis=1) - df['low']
+    upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
+
+    bullish_rejection = lower_wick > (1.8 * body)
+    bearish_rejection = upper_wick > (1.8 * body)
+    is_valid_body = body.iloc[-1] > (total_range.iloc[-1] * 0.25)
+
+    curr_close = float(df['close'].iloc[-1])
+    curr_low = float(df['low'].iloc[-1])
+    curr_high = float(df['high'].iloc[-1])
+    support = float(df['Support'].iloc[-1])
+    resistance = float(df['Resistance'].iloc[-1])
+    rsi = float(df['RSI'].iloc[-1])
+    ema = float(df['EMA100'].iloc[-1])
+
+    buffer = curr_close * 0.00015
+    at_support = curr_low <= (support + buffer)
+    at_resistance = curr_high >= (resistance - buffer)
+
+    print(f"[SCAN] {display_name} | Price: {curr_close:.5f} | RSI: {rsi:.1f} | S: {support:.5f} | R: {resistance:.5f}", flush=True)
+
+    curr_last = last_signals.get(display_name, None)
+
+    # 3-Layer Confluence Verification
+    if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body and curr_last != "CALL":
+        strategy = "Support Bounce + Uptrend EMA + RSI Oversold + Hammer"
+        send_signal(display_name, "CALL", "2-3 Min", strategy, curr_close)
+        last_signals[display_name] = "CALL"
+
+    elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body and curr_last != "PUT":
+        strategy = "Resistance Rejection + Downtrend EMA + RSI Overbought + Pinbar"
+        send_signal(display_name, "PUT", "2-3 Min", strategy, curr_close)
+        last_signals[display_name] = "PUT"
+
+    elif not at_support and not at_resistance:
+        last_signals[display_name] = None
+
+
+def fetch_and_scan(display_name, symbol):
+    """Fetches real-time candles via Deriv WebSocket."""
     try:
-        res = requests.get(url, timeout=10)
-        data = res.json()
+        ws = websocket.create_connection(DERIV_WS_URL, timeout=10)
+        req = {
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": 50,
+            "end": "latest",
+            "granularity": 60,
+            "style": "candles"
+        }
+        ws.send(json.dumps(req))
+        res = ws.recv()
+        data = json.loads(res)
+        ws.close()
 
-        if data.get('s') != 'ok':
-            print(f"[DEBUG] {display_name} API Status: {data}", flush=True)
-            return
-
-        df = pd.DataFrame({
-            'open': data['o'],
-            'high': data['h'],
-            'low': data['l'],
-            'close': data['c'],
-            'timestamp': data['t']
-        })
-
-        if len(df) < 25:
-            print(f"[WAIT] {display_name}: Insufficient historical bars ({len(df)})", flush=True)
-            return
-
-        # 1. Dynamic Support & Resistance (Last 20 Candles)
-        df['Support'] = df['low'].shift(1).rolling(window=20).min()
-        df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
-
-        # 2. RSI Indicator (14 Period)
-        df['RSI'] = calculate_rsi(df['close'], 14)
-
-        # 3. EMA 100 Trend Direction
-        df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
-
-        # Candlestick Anatomy
-        body = (df['close'] - df['open']).abs()
-        total_range = df['high'] - df['low']
-        lower_wick = df[['open', 'close']].min(axis=1) - df['low']
-        upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
-
-        bullish_rejection = lower_wick > (1.8 * body)
-        bearish_rejection = upper_wick > (1.8 * body)
-        is_valid_body = body.iloc[-1] > (total_range.iloc[-1] * 0.25)
-
-        curr_close = float(df['close'].iloc[-1])
-        curr_low = float(df['low'].iloc[-1])
-        curr_high = float(df['high'].iloc[-1])
-        support = float(df['Support'].iloc[-1])
-        resistance = float(df['Resistance'].iloc[-1])
-        rsi = float(df['RSI'].iloc[-1])
-        ema = float(df['EMA100'].iloc[-1])
-
-        buffer = curr_close * 0.00015
-        at_support = curr_low <= (support + buffer)
-        at_resistance = curr_high >= (resistance - buffer)
-
-        print(f"[SCAN] {display_name} | Close: {curr_close:.5f} | RSI: {rsi:.1f} | Supp: {support:.5f} | Res: {resistance:.5f}", flush=True)
-
-        curr_last = last_signals.get(display_name, None)
-
-        # --- 3-Layer Confluence Signal Logic ---
-        # 1. CALL Setup
-        if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body and curr_last != "CALL":
-            strategy = "Support Reversal + Uptrend EMA + RSI Oversold + Hammer"
-            send_signal(display_name, "CALL", "2-3 Min", strategy, curr_close)
-            last_signals[display_name] = "CALL"
-
-        # 2. PUT Setup
-        elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body and curr_last != "PUT":
-            strategy = "Resistance Reversal + Downtrend EMA + RSI Overbought + Shooting Star"
-            send_signal(display_name, "PUT", "2-3 Min", strategy, curr_close)
-            last_signals[display_name] = "PUT"
-
-        elif not at_support and not at_resistance:
-            last_signals[display_name] = None
-
-    except requests.exceptions.Timeout:
-        print(f"[TIMEOUT] {display_name}: Finnhub request timed out", flush=True)
-    except Exception as err:
-        print(f"[ERROR] {display_name}: {err}", flush=True)
+        if "candles" in data:
+            analyze_candles(display_name, data["candles"])
+        elif "error" in data:
+            print(f"[DERIV ERROR] {display_name}: {data['error'].get('message')}", flush=True)
+    except Exception as e:
+        print(f"[FETCH ERROR] {display_name}: {e}", flush=True)
 
 
 def background_scanner():
-    """Continuous scanner loop respecting Finnhub rate limits (60 requests/minute)."""
-    print("[ACTIVE] Finnhub Real-time 24/7 Scanner Running...", flush=True)
+    """Loops through all 10 forex pairs continuously."""
+    print("[ACTIVE] Deriv Unlimited Zero-Delay Forex Scanner Running...", flush=True)
     while True:
         for display_name, symbol in forex_pairs.items():
-            scan_pair(display_name, symbol)
-            time.sleep(1.2)
+            fetch_and_scan(display_name, symbol)
+            time.sleep(1)
         time.sleep(2)
 
 
-# Start worker thread
+# Launch scanner thread
 scanner_thread = threading.Thread(target=background_scanner)
 scanner_thread.daemon = True
 scanner_thread.start()
@@ -201,7 +198,7 @@ scanner_thread.start()
 
 @app.route('/')
 def health():
-    return "Finnhub Live Trading Bot is Healthy and Active 24/7!", 200
+    return "Deriv Live 24/7 Zero-Delay Trading Bot is Healthy!", 200
 
 
 if __name__ == "__main__":
