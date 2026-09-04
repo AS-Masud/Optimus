@@ -6,10 +6,10 @@ import requests
 import pusher
 from flask import Flask
 
-# --- Flask Server Setup ---
+# --- Flask Server Setup (Keep Render Alive) ---
 app = Flask(__name__)
 
-# --- Pusher Credentials ---
+# --- Pusher Configuration ---
 PUSHER_APP_ID = os.environ.get('PUSHER_APP_ID', '2190746')
 PUSHER_KEY = os.environ.get('PUSHER_KEY', 'f6d226d63552173e92b9')
 PUSHER_SECRET = os.environ.get('PUSHER_SECRET', '0ab61f388d482d06c232')
@@ -22,7 +22,7 @@ pusher_client = pusher.Pusher(
     ssl=True
 )
 
-# --- Telegram Credentials ---
+# --- Telegram Bot Configuration ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
@@ -47,11 +47,11 @@ last_signals = {}
 
 
 def send_signal(pair, direction, tf, strategy_name, price):
-    """Sends trading signals to Telegram and Pusher."""
+    """Dispatches high-probability trading signals to Pusher and Telegram."""
     clean_pair = pair.replace("/", "")
     print(f"\n[HIGH-PROBABILITY SIGNAL] {clean_pair} -> {direction} @ {price:.5f}", flush=True)
 
-    # 1. Pusher Event
+    # 1. Pusher Notification
     try:
         pusher_client.trigger('trading-signals', 'new-signal', {
             'pair': clean_pair,
@@ -85,7 +85,7 @@ def send_signal(pair, direction, tf, strategy_name, price):
 
 
 def calculate_rsi(series, period=14):
-    """Calculates RSI."""
+    """Calculates Relative Strength Index."""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -94,11 +94,11 @@ def calculate_rsi(series, period=14):
 
 
 def scan_pair(display_name, symbol):
-    """Fetches Finnhub 1m candles and runs confluence filters."""
+    """Fetches real-time 1m candles from Finnhub and executes 3-layer confluence checks."""
     global last_signals
 
     now = int(time.time())
-    start_time = now - (60 * 60)  # Last 60 minutes
+    start_time = now - (60 * 60)  # Lookback past 60 minutes
 
     url = (
         f"https://finnhub.io/api/v1/forex/candle?"
@@ -106,10 +106,11 @@ def scan_pair(display_name, symbol):
     )
 
     try:
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, timeout=10)
         data = res.json()
 
         if data.get('s') != 'ok':
+            print(f"[DEBUG] {display_name} API Status: {data}", flush=True)
             return
 
         df = pd.DataFrame({
@@ -121,19 +122,20 @@ def scan_pair(display_name, symbol):
         })
 
         if len(df) < 25:
+            print(f"[WAIT] {display_name}: Insufficient historical bars ({len(df)})", flush=True)
             return
 
-        # 1. Support & Resistance (Last 20 Candles)
+        # 1. Dynamic Support & Resistance (Last 20 Candles)
         df['Support'] = df['low'].shift(1).rolling(window=20).min()
         df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
 
-        # 2. RSI Indicator
+        # 2. RSI Indicator (14 Period)
         df['RSI'] = calculate_rsi(df['close'], 14)
 
         # 3. EMA 100 Trend Direction
         df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
 
-        # Candlestick Shapes
+        # Candlestick Anatomy
         body = (df['close'] - df['open']).abs()
         total_range = df['high'] - df['low']
         lower_wick = df[['open', 'close']].min(axis=1) - df['low']
@@ -143,51 +145,55 @@ def scan_pair(display_name, symbol):
         bearish_rejection = upper_wick > (1.8 * body)
         is_valid_body = body.iloc[-1] > (total_range.iloc[-1] * 0.25)
 
-        curr_close = df['close'].iloc[-1]
-        curr_low = df['low'].iloc[-1]
-        curr_high = df['high'].iloc[-1]
-        support = df['Support'].iloc[-1]
-        resistance = df['Resistance'].iloc[-1]
-        rsi = df['RSI'].iloc[-1]
-        ema = df['EMA100'].iloc[-1]
+        curr_close = float(df['close'].iloc[-1])
+        curr_low = float(df['low'].iloc[-1])
+        curr_high = float(df['high'].iloc[-1])
+        support = float(df['Support'].iloc[-1])
+        resistance = float(df['Resistance'].iloc[-1])
+        rsi = float(df['RSI'].iloc[-1])
+        ema = float(df['EMA100'].iloc[-1])
 
         buffer = curr_close * 0.00015
         at_support = curr_low <= (support + buffer)
         at_resistance = curr_high >= (resistance - buffer)
 
+        print(f"[SCAN] {display_name} | Close: {curr_close:.5f} | RSI: {rsi:.1f} | Supp: {support:.5f} | Res: {resistance:.5f}", flush=True)
+
         curr_last = last_signals.get(display_name, None)
 
-        # --- 3-Layer Confluence Filter ---
-        # CALL Criteria
+        # --- 3-Layer Confluence Signal Logic ---
+        # 1. CALL Setup
         if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body and curr_last != "CALL":
-            strategy = "Support Bounce + Uptrend + RSI Oversold + Hammer"
+            strategy = "Support Reversal + Uptrend EMA + RSI Oversold + Hammer"
             send_signal(display_name, "CALL", "2-3 Min", strategy, curr_close)
             last_signals[display_name] = "CALL"
 
-        # PUT Criteria
+        # 2. PUT Setup
         elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body and curr_last != "PUT":
-            strategy = "Resistance Rejection + Downtrend + RSI Overbought + Pinbar"
+            strategy = "Resistance Reversal + Downtrend EMA + RSI Overbought + Shooting Star"
             send_signal(display_name, "PUT", "2-3 Min", strategy, curr_close)
             last_signals[display_name] = "PUT"
 
         elif not at_support and not at_resistance:
             last_signals[display_name] = None
 
+    except requests.exceptions.Timeout:
+        print(f"[TIMEOUT] {display_name}: Finnhub request timed out", flush=True)
     except Exception as err:
-        print(f"Error scanning {display_name}: {err}", flush=True)
+        print(f"[ERROR] {display_name}: {err}", flush=True)
 
 
 def background_scanner():
-    """Continuously scans 10 forex pairs without hitting limits."""
+    """Continuous scanner loop respecting Finnhub rate limits (60 requests/minute)."""
     print("[ACTIVE] Finnhub Real-time 24/7 Scanner Running...", flush=True)
     while True:
         for display_name, symbol in forex_pairs.items():
             scan_pair(display_name, symbol)
-            time.sleep(1.2)  # Well within Finnhub's 60 calls/min limit
+            time.sleep(1.2)
         time.sleep(2)
 
 
-# Launch background worker
+# Start worker thread
 scanner_thread = threading.Thread(target=background_scanner)
 scanner_thread.daemon = True
 scanner_thread.start()
@@ -195,7 +201,7 @@ scanner_thread.start()
 
 @app.route('/')
 def health():
-    return "Finnhub Trading Bot is Healthy and Active 24/7!", 200
+    return "Finnhub Live Trading Bot is Healthy and Active 24/7!", 200
 
 
 if __name__ == "__main__":
