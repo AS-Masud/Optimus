@@ -26,10 +26,10 @@ pusher_client = pusher.Pusher(
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- TwelveData API Key (Sign up for free at twelvedata.com) ---
+# --- TwelveData API Key ---
 TWELVE_DATA_API_KEY = os.environ.get('TWELVE_DATA_API_KEY', '31c5e6f950c44a41a06b90dc6a57f8a2')
 
-# --- Highly Liquid Forex Pairs (Slash format for TwelveData) ---
+# --- Active Pairs ---
 forex_pairs = [
     "EUR/USD", "GBP/JPY", "USD/JPY", "AUD/JPY", "EUR/JPY",
     "GBP/USD", "USD/CAD", "AUD/USD", "EUR/GBP"
@@ -39,7 +39,7 @@ last_signals = {}
 
 
 def send_signal(pair, direction, tf, strategy_name, price):
-    """Sends trading signal to Pusher and Telegram."""
+    """Dispatches high-probability trading signals to Pusher and Telegram."""
     clean_pair = pair.replace("/", "")
     print(f"\n[HIGH-PROBABILITY SIGNAL] {clean_pair} -> {direction} @ {price:.5f}", flush=True)
 
@@ -63,7 +63,7 @@ def send_signal(pair, direction, tf, strategy_name, price):
             f"📈 *Direction:* {direction} (CALL / PUT)\n"
             f"⏱ *Expiration:* {tf}\n"
             f"💵 *Entry Price:* {price:.5f}\n"
-            f"🧠 *Conditions:* {strategy_name}"
+            f"🧠 *Setup:* {strategy_name}"
         )
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -71,7 +71,7 @@ def send_signal(pair, direction, tf, strategy_name, price):
             'text': message,
             'parse_mode': 'Markdown'
         }
-        requests.post(url, json=payload, timeout=8)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram alert error: {e}", flush=True)
 
@@ -95,38 +95,39 @@ def scan_pair(pair):
     )
 
     try:
-        response = requests.get(url, timeout=6)
+        response = requests.get(url, timeout=12)
         res_json = response.json()
 
         if "values" not in res_json:
             return
 
-        # Prepare DataFrame
         df = pd.DataFrame(res_json["values"])
-        df = df.iloc[::-1].reset_index(drop=True)  # Chronological order
+        df = df.iloc[::-1].reset_index(drop=True)
 
         df['open'] = df['open'].astype(float)
         df['high'] = df['high'].astype(float)
         df['low'] = df['low'].astype(float)
         df['close'] = df['close'].astype(float)
 
-        # 1. Dynamic Support & Resistance (Last 20 Candles)
+        # 1. Dynamic Support & Resistance
         df['Support'] = df['low'].shift(1).rolling(window=20).min()
         df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
 
         # 2. RSI Indicator
         df['RSI'] = calculate_rsi(df['close'], 14)
 
-        # 3. EMA 50 Trend Direction
-        df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
+        # 3. EMA 100 Trend Direction
+        df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
 
-        # Candlestick Shapes
+        # Candlestick Calculations
         body = (df['close'] - df['open']).abs()
+        total_range = df['high'] - df['low']
         lower_wick = df[['open', 'close']].min(axis=1) - df['low']
         upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
 
         bullish_rejection = lower_wick > (1.8 * body)
         bearish_rejection = upper_wick > (1.8 * body)
+        is_valid_body = body.iloc[-1] > (total_range.iloc[-1] * 0.25)
 
         curr_close = df['close'].iloc[-1]
         curr_low = df['low'].iloc[-1]
@@ -134,7 +135,7 @@ def scan_pair(pair):
         support = df['Support'].iloc[-1]
         resistance = df['Resistance'].iloc[-1]
         rsi = df['RSI'].iloc[-1]
-        ema = df['EMA50'].iloc[-1]
+        ema = df['EMA100'].iloc[-1]
 
         buffer = curr_close * 0.00015
         at_support = curr_low <= (support + buffer)
@@ -142,38 +143,39 @@ def scan_pair(pair):
 
         curr_last = last_signals.get(pair, None)
 
-        # --- High Win-Rate Setup Logic ---
+        # --- High-Probability Confluence Filter ---
 
-        # 1. CALL Criteria: At Support + RSI Oversold (<38) + Strong Lower Wick Rejection
-        if at_support and rsi < 38 and bullish_rejection.iloc[-1] and curr_last != "CALL":
-            strategy = "Support Bounce + RSI Oversold + Hammer Rejection"
-            send_signal(pair, "CALL", "1 Min", strategy, curr_close)
+        # 1. CALL: At Support + Uptrend (Close > EMA100) + RSI Oversold (<35) + Hammer Rejection
+        if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body and curr_last != "CALL":
+            strategy = "Support Bounce + Uptrend + RSI Oversold + Hammer"
+            send_signal(pair, "CALL", "2-3 Min", strategy, curr_close)
             last_signals[pair] = "CALL"
 
-        # 2. PUT Criteria: At Resistance + RSI Overbought (>62) + Strong Upper Wick Rejection
-        elif at_resistance and rsi > 62 and bearish_rejection.iloc[-1] and curr_last != "PUT":
-            strategy = "Resistance Rejection + RSI Overbought + Shooting Star"
-            send_signal(pair, "PUT", "1 Min", strategy, curr_close)
+        # 2. PUT: At Resistance + Downtrend (Close < EMA100) + RSI Overbought (>65) + Star Rejection
+        elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body and curr_last != "PUT":
+            strategy = "Resistance Rejection + Downtrend + RSI Overbought + Pinbar"
+            send_signal(pair, "PUT", "2-3 Min", strategy, curr_close)
             last_signals[pair] = "PUT"
 
         elif not at_support and not at_resistance:
             last_signals[pair] = None
 
+    except requests.exceptions.Timeout:
+        pass
     except Exception as err:
         print(f"Error parsing {pair}: {err}", flush=True)
 
 
 def background_scanner():
-    """Main continuous scanner loop."""
+    """Main continuous scanner loop throttled to avoid TwelveData free tier limits."""
     print("[ACTIVE] Real-time High Probability PA Bot Running...", flush=True)
     while True:
         for pair in forex_pairs:
             scan_pair(pair)
-            time.sleep(1.2)  # Avoid rate limit on free API key
-        time.sleep(3)
+            time.sleep(8)  # Complies with 8 requests/min limit
 
 
-# Run background scanner thread
+# Launch background worker
 scanner_thread = threading.Thread(target=background_scanner)
 scanner_thread.daemon = True
 scanner_thread.start()
