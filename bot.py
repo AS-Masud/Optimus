@@ -28,17 +28,27 @@ pusher_client = pusher.Pusher(
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- Deriv 10 Major Forex Symbols ---
+# --- All 21 Forex Pairs from Image (Deriv Symbols) ---
 forex_pairs = {
-    "EUR/USD": "frxEURUSD",
-    "GBP/USD": "frxGBPUSD",
-    "USD/JPY": "frxUSDJPY",
-    "AUD/USD": "frxAUDUSD",
-    "USD/CAD": "frxUSDCAD",
     "EUR/JPY": "frxEURJPY",
+    "EUR/USD": "frxEURUSD",
+    "CAD/JPY": "frxCADJPY",
     "GBP/JPY": "frxGBPJPY",
+    "GBP/AUD": "frxGBPAUD",
     "AUD/JPY": "frxAUDJPY",
+    "AUD/USD": "frxAUDUSD",
+    "CHF/JPY": "frxCHFJPY",
+    "EUR/CHF": "frxEURCHF",
+    "USD/JPY": "frxUSDJPY",
+    "AUD/CAD": "frxAUDCAD",
+    "EUR/CAD": "frxEURCAD",
+    "EUR/AUD": "frxEURAUD",
+    "GBP/CHF": "frxGBPCHF",
+    "AUD/CHF": "frxAUDCHF",
     "EUR/GBP": "frxEURGBP",
+    "GBP/CAD": "frxGBPCAD",
+    "GBP/USD": "frxGBPUSD",
+    "USD/CAD": "frxUSDCAD",
     "USD/CHF": "frxUSDCHF"
 }
 
@@ -136,7 +146,7 @@ def analyze_candles(display_name, candles):
     at_support = curr_low <= (support + buffer)
     at_resistance = curr_high >= (resistance - buffer)
 
-    print(f"[SCAN] {display_name} | Price: {curr_close:.5f} | RSI: {rsi:.1f} | S: {support:.5f} | R: {resistance:.5f}", flush=True)
+    print(f"[SCAN] {display_name:<7} | Price: {curr_close:<9.5f} | RSI: {rsi:<4.1f} | S: {support:<9.5f} | R: {resistance:<9.5f}", flush=True)
 
     curr_last = last_signals.get(display_name, None)
 
@@ -158,7 +168,7 @@ def analyze_candles(display_name, candles):
 def fetch_and_scan(display_name, symbol):
     """Fetches real-time candles via Deriv WebSocket."""
     try:
-        ws = websocket.create_connection(DERIV_WS_URL, timeout=10)
+        ws = websocket.create_connection(DERIV_WS_URL, timeout=8)
         req = {
             "ticks_history": symbol,
             "adjust_start_time": 1,
@@ -181,13 +191,13 @@ def fetch_and_scan(display_name, symbol):
 
 
 def background_scanner():
-    """Loops through all 10 forex pairs continuously."""
-    print("[ACTIVE] Deriv Unlimited Zero-Delay Forex Scanner Running...", flush=True)
+    """Loops through all 20+ pairs continuously with optimized interval."""
+    print("[ACTIVE] Deriv 20+ Forex Pairs Real-Time Scanner Running...", flush=True)
     while True:
         for display_name, symbol in forex_pairs.items():
             fetch_and_scan(display_name, symbol)
-            time.sleep(1)
-        time.sleep(2)
+            time.sleep(0.5)  # Fast continuous loop across 20+ pairs
+        time.sleep(1)
 
 
 # Launch scanner thread
@@ -198,7 +208,7 @@ scanner_thread.start()
 
 @app.route('/')
 def health():
-    return "Deriv Live 24/7 Zero-Delay Trading Bot is Healthy!", 200
+    return "Deriv 20+ Pairs Trading Engine is Active!", 200
 
 
 if __name__ == "__main__":
