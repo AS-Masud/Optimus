@@ -147,18 +147,15 @@ def analyze_and_lock(display_name, candles):
     df['close'] = df['close'].astype(float)
     df['epoch'] = df['epoch'].astype(int)
 
-    # Trade Candle is the current ongoing candle (iloc[-1])
     trade_candle_epoch = int(df['epoch'].iloc[-1])
     
     state = pair_states[display_name]
     clean_pair = display_name.replace("/", "")
     signal_key = f"{clean_pair}_{trade_candle_epoch}"
 
-    # If already locked or evaluated for this exact trade candle, bypass
     if state["active_trade_candle"] == trade_candle_epoch and state["is_locked"]:
         return
 
-    # New Trade Candle started -> Reset or Initialize State
     if state["active_trade_candle"] != trade_candle_epoch:
         print(f"\n[NEW CANDLE] {display_name} | Trade Candle: {format_time(trade_candle_epoch)}", flush=True)
         state["active_trade_candle"] = trade_candle_epoch
@@ -166,18 +163,14 @@ def analyze_and_lock(display_name, candles):
         state["notification_sent"] = False
         state["signal_direction"] = "NO TRADE"
 
-    # Exclude the current ongoing candle (-1) to calculate indicators strictly on completed candles
     df_analysis = df.iloc[:-1].copy()
 
-    # 1. Dynamic Support & Resistance on completed candles
     df_analysis['Support'] = df_analysis['low'].shift(1).rolling(window=20).min()
     df_analysis['Resistance'] = df_analysis['high'].shift(1).rolling(window=20).max()
 
-    # 2. Indicators on completed candles
     df_analysis['RSI'] = calculate_rsi(df_analysis['close'], 14)
     df_analysis['EMA100'] = df_analysis['close'].ewm(span=100, adjust=False).mean()
 
-    # Candlestick Anatomy of the last completed candle
     body = (df_analysis['close'] - df_analysis['open']).abs()
     total_range = df_analysis['high'] - df_analysis['low']
     lower_wick = df_analysis[['open', 'close']].min(axis=1) - df_analysis['low']
@@ -202,7 +195,6 @@ def analyze_and_lock(display_name, candles):
     analysis_candle_time = format_time(int(df_analysis['epoch'].iloc[-1]))
     print(f"[CANDLE] {display_name:<7} | Analysis Candle: {analysis_candle_time} | Close: {curr_close:<9.5f} | RSI: {rsi:<4.1f}", flush=True)
 
-    # Confluence Checks for Next Candle Entry
     direction = "NO TRADE"
     strategy = None
 
@@ -213,7 +205,6 @@ def analyze_and_lock(display_name, candles):
         direction = "PUT"
         strategy = "Resistance Rejection + EMA100 + RSI + Bearish Rejection"
 
-    # Lock state for this trade candle
     state["signal_direction"] = direction
     state["strategy"] = strategy
     state["entry_time"] = trade_candle_epoch
@@ -233,33 +224,34 @@ def analyze_and_lock(display_name, candles):
 
 
 def fetch_pair_data(ws, display_name, symbol):
-    """Requests and processes historical candles for a single pair using persistent WS connection."""
-    try:
-        req = {
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": 50,
-            "end": "latest",
-            "granularity": 60,
-            "style": "candles"
-        }
-        ws.send(json.dumps(req))
-        res = ws.recv()
-        data = json.loads(res)
+    """Requests and processes historical candles for a single pair with error raising for reconnection."""
+    req = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": 50,
+        "end": "latest",
+        "granularity": 60,
+        "style": "candles"
+    }
+    ws.send(json.dumps(req))
+    res = ws.recv()
+    if not res:
+        raise Exception("Empty response received from WebSocket")
+    
+    data = json.loads(res)
 
-        if "candles" in data:
-            analyze_and_lock(display_name, data["candles"])
-        elif "error" in data:
-            print(f"[DERIV ERROR] {display_name}: {data['error'].get('message')}", flush=True)
-    except Exception as e:
-        print(f"[FETCH ERROR] {display_name}: {e}", flush=True)
+    if "candles" in data:
+        analyze_and_lock(display_name, data["candles"])
+    elif "error" in data:
+        print(f"[DERIV ERROR] {display_name}: {data['error'].get('message')}", flush=True)
 
 
 def background_scanner():
-    """Main background loop utilizing a persistent WebSocket connection with precise candle boundary synchronization."""
+    """Main background loop with automatic socket recovery and safety throttles."""
     print("[ACTIVE] Deriv 20+ Forex Pairs Next-Candle Precision Scanner Running...", flush=True)
     
     while True:
+        ws = None
         try:
             ws = websocket.create_connection(DERIV_WS_URL, timeout=10)
             print("[WS CONNECTED] Established persistent connection to Deriv API.", flush=True)
@@ -274,13 +266,23 @@ def background_scanner():
                     last_scanned_candle_epoch = current_trade_candle_epoch
                     
                     for display_name, symbol in forex_pairs.items():
-                        fetch_pair_data(ws, display_name, symbol)
-                        time.sleep(0.2)
+                        try:
+                            fetch_pair_data(ws, display_name, symbol)
+                        except Exception as inner_e:
+                            print(f"[WS ERROR on {display_name}]: {inner_e}", flush=True)
+                            raise inner_e  # Force break out of inner loop to trigger fresh reconnection
+                        
+                        time.sleep(0.3)  # Safe throttle to prevent Deriv rate limits
 
                 time.sleep(0.5)
 
         except Exception as e:
             print(f"[WS CONNECTION LOST]: {e}. Reconnecting in 3 seconds...", flush=True)
+            if ws:
+                try:
+                    ws.close()
+                except:
+                    pass
             time.sleep(3)
 
 
