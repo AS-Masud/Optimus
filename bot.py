@@ -65,7 +65,6 @@ for pair in forex_pairs.keys():
         "strategy": None,
         "entry_time": None,
         "expiry_time": None,
-        "trade_candle_str": None,
         "is_locked": False,
         "notification_sent": False
     }
@@ -134,25 +133,9 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def analyze_and_lock(display_name, candles, current_trade_candle_epoch):
-    """Applies strategy on completed analysis candle and locks state for the next trade candle without mid-candle flipping."""
+def analyze_and_lock(display_name, candles):
+    """Applies strategy on the last completed candle (iloc[-2]) and locks state for the current trade candle (iloc[-1])."""
     global pair_states, sent_signals_tracker
-
-    state = pair_states[display_name]
-    clean_pair = display_name.replace("/", "")
-    signal_key = f"{clean_pair}_{current_trade_candle_epoch}"
-
-    # If already locked or evaluated for this exact trade candle, bypass to prevent duplicate/opposite triggers
-    if state["active_trade_candle"] == current_trade_candle_epoch and state["is_locked"]:
-        return
-
-    # New Trade Candle started -> Reset or Initialize State
-    if state["active_trade_candle"] != current_trade_candle_epoch:
-        print(f"\n[NEW CANDLE] {display_name} | Trade Candle: {format_time(current_trade_candle_epoch)}", flush=True)
-        state["active_trade_candle"] = current_trade_candle_epoch
-        state["is_locked"] = False
-        state["notification_sent"] = False
-        state["signal_direction"] = "NO TRADE"
 
     if len(candles) < 30:
         return
@@ -162,63 +145,85 @@ def analyze_and_lock(display_name, candles, current_trade_candle_epoch):
     df['high'] = df['high'].astype(float)
     df['low'] = df['low'].astype(float)
     df['close'] = df['close'].astype(float)
+    df['epoch'] = df['epoch'].astype(int)
 
-    # 1. Dynamic Support & Resistance (Look-ahead bias prevented by shifting)
-    df['Support'] = df['low'].shift(1).rolling(window=20).min()
-    df['Resistance'] = df['high'].shift(1).rolling(window=20).max()
+    # Trade Candle is the current ongoing candle (iloc[-1])
+    trade_candle_epoch = int(df['epoch'].iloc[-1])
+    
+    state = pair_states[display_name]
+    clean_pair = display_name.replace("/", "")
+    signal_key = f"{clean_pair}_{trade_candle_epoch}"
 
-    # 2. Indicators
-    df['RSI'] = calculate_rsi(df['close'], 14)
-    df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
+    # If already locked or evaluated for this exact trade candle, bypass
+    if state["active_trade_candle"] == trade_candle_epoch and state["is_locked"]:
+        return
 
-    # Candlestick Anatomy
-    body = (df['close'] - df['open']).abs()
-    total_range = df['high'] - df['low']
-    lower_wick = df[['open', 'close']].min(axis=1) - df['low']
-    upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
+    # New Trade Candle started -> Reset or Initialize State
+    if state["active_trade_candle"] != trade_candle_epoch:
+        print(f"\n[NEW CANDLE] {display_name} | Trade Candle: {format_time(trade_candle_epoch)}", flush=True)
+        state["active_trade_candle"] = trade_candle_epoch
+        state["is_locked"] = False
+        state["notification_sent"] = False
+        state["signal_direction"] = "NO TRADE"
+
+    # Exclude the current ongoing candle (-1) to calculate indicators strictly on completed candles
+    df_analysis = df.iloc[:-1].copy()
+
+    # 1. Dynamic Support & Resistance on completed candles
+    df_analysis['Support'] = df_analysis['low'].shift(1).rolling(window=20).min()
+    df_analysis['Resistance'] = df_analysis['high'].shift(1).rolling(window=20).max()
+
+    # 2. Indicators on completed candles
+    df_analysis['RSI'] = calculate_rsi(df_analysis['close'], 14)
+    df_analysis['EMA100'] = df_analysis['close'].ewm(span=100, adjust=False).mean()
+
+    # Candlestick Anatomy of the last completed candle
+    body = (df_analysis['close'] - df_analysis['open']).abs()
+    total_range = df_analysis['high'] - df_analysis['low']
+    lower_wick = df_analysis[['open', 'close']].min(axis=1) - df_analysis['low']
+    upper_wick = df_analysis['high'] - df_analysis[['open', 'close']].max(axis=1)
 
     bullish_rejection = lower_wick > (1.8 * body)
     bearish_rejection = upper_wick > (1.8 * body)
-    is_valid_body = body.iloc[-1] > (total_range.iloc[-1] * 0.25)
+    is_valid_body = body > (total_range * 0.25)
 
-    curr_close = float(df['close'].iloc[-1])
-    curr_low = float(df['low'].iloc[-1])
-    curr_high = float(df['high'].iloc[-1])
-    support = float(df['Support'].iloc[-1])
-    resistance = float(df['Resistance'].iloc[-1])
-    rsi = float(df['RSI'].iloc[-1])
-    ema = float(df['EMA100'].iloc[-1])
+    curr_close = float(df_analysis['close'].iloc[-1])
+    curr_low = float(df_analysis['low'].iloc[-1])
+    curr_high = float(df_analysis['high'].iloc[-1])
+    support = float(df_analysis['Support'].iloc[-1])
+    resistance = float(df_analysis['Resistance'].iloc[-1])
+    rsi = float(df_analysis['RSI'].iloc[-1])
+    ema = float(df_analysis['EMA100'].iloc[-1])
 
     buffer = curr_close * 0.00015
     at_support = curr_low <= (support + buffer)
     at_resistance = curr_high >= (resistance - buffer)
 
-    analysis_candle_time = format_time(int(df['epoch'].iloc[-1]))
+    analysis_candle_time = format_time(int(df_analysis['epoch'].iloc[-1]))
     print(f"[CANDLE] {display_name:<7} | Analysis Candle: {analysis_candle_time} | Close: {curr_close:<9.5f} | RSI: {rsi:<4.1f}", flush=True)
 
     # Confluence Checks for Next Candle Entry
     direction = "NO TRADE"
     strategy = None
 
-    if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body:
+    if at_support and curr_close > ema and rsi < 35 and bullish_rejection.iloc[-1] and is_valid_body.iloc[-1]:
         direction = "CALL"
         strategy = "Support Bounce + EMA100 + RSI + Bullish Rejection"
-    elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body:
+    elif at_resistance and curr_close < ema and rsi > 65 and bearish_rejection.iloc[-1] and is_valid_body.iloc[-1]:
         direction = "PUT"
         strategy = "Resistance Rejection + EMA100 + RSI + Bearish Rejection"
 
     # Lock state for this trade candle
     state["signal_direction"] = direction
     state["strategy"] = strategy
-    state["entry_time"] = current_trade_candle_epoch
-    state["expiry_time"] = current_trade_candle_epoch + 60
+    state["entry_time"] = trade_candle_epoch
+    state["expiry_time"] = trade_candle_epoch + 60
     state["is_locked"] = True
 
     if direction != "NO TRADE":
-        # Strict Duplicate Protection Check via PAIR + TRADE_CANDLE_TIMESTAMP key
         if signal_key not in sent_signals_tracker:
             sent_signals_tracker.add(signal_key)
-            print(f"[SIGNAL READY] {display_name} {direction} | Trade Candle: {format_time(current_trade_candle_epoch)}", flush=True)
+            print(f"[SIGNAL READY] {display_name} {direction} | Trade Candle: {format_time(trade_candle_epoch)}", flush=True)
             send_signal(display_name, direction, state["entry_time"], state["expiry_time"], strategy, curr_close)
             state["notification_sent"] = True
         else:
@@ -227,7 +232,7 @@ def analyze_and_lock(display_name, candles, current_trade_candle_epoch):
         print(f"[NO TRADE] {display_name} - Criteria not met. No Telegram signal sent.", flush=True)
 
 
-def fetch_pair_data(ws, display_name, symbol, current_trade_epoch):
+def fetch_pair_data(ws, display_name, symbol):
     """Requests and processes historical candles for a single pair using persistent WS connection."""
     try:
         req = {
@@ -243,7 +248,7 @@ def fetch_pair_data(ws, display_name, symbol, current_trade_epoch):
         data = json.loads(res)
 
         if "candles" in data:
-            analyze_and_lock(display_name, data["candles"], current_trade_epoch)
+            analyze_and_lock(display_name, data["candles"])
         elif "error" in data:
             print(f"[DERIV ERROR] {display_name}: {data['error'].get('message')}", flush=True)
     except Exception as e:
@@ -263,18 +268,15 @@ def background_scanner():
 
             while ws.connected:
                 now_epoch = int(time.time())
-                # Exact 1-minute candle boundary calculation (timestamp // 60 * 60)
                 current_trade_candle_epoch = (now_epoch // 60) * 60
 
-                # Scan only once per new candle boundary to avoid redundant requests
                 if current_trade_candle_epoch != last_scanned_candle_epoch:
                     last_scanned_candle_epoch = current_trade_candle_epoch
                     
                     for display_name, symbol in forex_pairs.items():
-                        fetch_pair_data(ws, display_name, symbol, current_trade_candle_epoch)
-                        time.sleep(0.2)  # Short throttle between pairs to respect API limits
+                        fetch_pair_data(ws, display_name, symbol)
+                        time.sleep(0.2)
 
-                # Sleep briefly until close to the next second
                 time.sleep(0.5)
 
         except Exception as e:
