@@ -28,7 +28,7 @@ pusher_client = pusher.Pusher(
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8893372314:AAEIf8UbuT1_WMYfqPTBpXCtWJLEmrvJIR4')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1004489990906')
 
-# --- All 21 Forex Pairs from Image (Deriv Symbols) ---
+# --- All 21 Forex Pairs (Deriv Symbols) ---
 forex_pairs = {
     "EUR/JPY": "frxEURJPY",
     "EUR/USD": "frxEURUSD",
@@ -71,12 +71,13 @@ for pair in forex_pairs.keys():
 
 
 def format_time(epoch):
-    """Converts epoch timestamp to HH:MM:SS format."""
-    return time.strftime('%H:%M:%S', time.gmtime(epoch))
+    """Converts epoch timestamp to HH:MM:SS format in UTC+6."""
+    utc_plus_6_epoch = epoch + (6 * 3600)  # ৬ ঘণ্টা (২১,৬০০ সেকেন্ড) যোগ করা হয়েছে
+    return time.strftime('%H:%M:%S', time.gmtime(utc_plus_6_epoch))
 
 
 def send_signal(pair, direction, entry_epoch, expiry_epoch, strategy_name, price):
-    """Sends strict locked trading signals to Telegram and Pusher matching exact formatting rules."""
+    """Sends strict locked trading signals to Telegram and Pusher matching exact screenshot formatting."""
     clean_pair = pair.replace("/", "")
     entry_str = format_time(entry_epoch)
     expiry_str = format_time(expiry_epoch)
@@ -99,25 +100,24 @@ def send_signal(pair, direction, entry_epoch, expiry_epoch, strategy_name, price
     except Exception as e:
         print(f"Pusher error: {e}", flush=True)
 
-    # 2. Telegram Alert (Strict Mandated Format)
+    # 2. Telegram Alert (Exact Visual Layout & Emojis)
     try:
         message = (
-            f"🎯 *NEXT 1-MINUTE SIGNAL*\n\n"
-            f"💱 *Pair:* {clean_pair}\n"
-            f"{direction_emoji} *Direction:* {direction}\n"
-            f"🕐 *ENTRY:* `{entry_str}`\n"
-            f"⏳ *EXPIRY:* `{expiry_str}`\n"
-            f"📊 *TRADE CANDLE:*\n"
-            f"`{trade_candle_str}`\n\n"
-            f"🧠 *Strategy:*\n"
+            f"🎯 NEXT 1-MINUTE SIGNAL\n\n"
+            f"💱 Pair: {clean_pair}\n"
+            f"{direction_emoji} Direction: {direction}\n"
+            f"🕒 ENTRY: {entry_str}\n"
+            f"⌛ EXPIRY: {expiry_str}\n"
+            f"📊 TRADE CANDLE:\n"
+            f"{trade_candle_str}\n\n"
+            f"🧠 Strategy:\n"
             f"{strategy_name}\n\n"
-            f"🔒 *STATUS:* LOCKED"
+            f"🔒 STATUS: LOCKED"
         )
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'Markdown'
+            'text': message
         }
         requests.post(url, json=payload, timeout=8)
     except Exception as e:
